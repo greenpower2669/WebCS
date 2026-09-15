@@ -6,5 +6,13 @@ pluginManagement {
     }
 }
 
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
 rootProject.name = "WebCS"
 include(":android:poc-camera")
