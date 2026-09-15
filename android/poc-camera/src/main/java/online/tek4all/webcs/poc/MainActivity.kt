@@ -1,12 +1,16 @@
 package online.tek4all.webcs.poc
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
+import android.speech.tts.TextToSpeech
 import android.util.Size
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -23,21 +27,41 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
     private lateinit var decisionText: TextView
     private lateinit var scoreText: TextView
     private lateinit var ecoButton: Button
+    private lateinit var recText: TextView
     private lateinit var cameraExecutor: ExecutorService
+    private lateinit var videoCapture: VideoCapture<Recorder>
+    private var recording: Recording? = null
+    private var recordingStopping = false
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
 
     @Volatile private var latestResult: ScanResult? = null
     private var score = 0
@@ -50,13 +74,28 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         cameraExecutor = Executors.newSingleThreadExecutor()
+        tts = TextToSpeech(this, this)
         score = getSharedPreferences("webcs", MODE_PRIVATE).getInt("score", 0)
         buildUi()
+        enterImmersiveMode()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startCamera()
         } else {
             cameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) enterImmersiveMode()
+    }
+
+    private fun enterImmersiveMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
 
@@ -68,6 +107,25 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(previewView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         root.addView(CrosshairView(this), FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+        recText = textView("● REC", 18f).apply {
+            setTextColor(Color.RED)
+            visibility = View.GONE
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setBackgroundColor(Color.argb(150, 0, 0, 0))
+        }
+        val recParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END)
+        recParams.setMargins(0, dp(12), dp(12), 0)
+        root.addView(recText, recParams)
+        ViewCompat.setOnApplyWindowInsetsListener(recText) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            (view.layoutParams as FrameLayout.LayoutParams).apply {
+                topMargin = bars.top + dp(12)
+                rightMargin = bars.right + dp(12)
+                view.layoutParams = this
+            }
+            insets
+        }
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -87,7 +145,7 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { fire() }
         }
         ecoButton = Button(this).apply {
-            text = "Mode éco"
+            text = "MODE ÉCO"
             setOnClickListener { toggleEco() }
         }
         row.addView(fireButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -95,7 +153,14 @@ class MainActivity : ComponentActivity() {
         panel.addView(row)
 
         root.addView(panel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        ViewCompat.setOnApplyWindowInsetsListener(panel) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(dp(16) + bars.left, dp(12), dp(16) + bars.right, dp(18) + bars.bottom)
+            insets
+        }
+
         setContentView(root)
+        ViewCompat.requestApplyInsets(root)
     }
 
     private fun textView(value: String, size: Float) = TextView(this).apply {
@@ -127,9 +192,14 @@ class MainActivity : ComponentActivity() {
                     image.close()
                 }
 
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(QualitySelector.from(Quality.SD))
+                    .build()
+                videoCapture = VideoCapture.withOutput(recorder)
+
                 provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
-                statusText.text = "Caméra prête. TIR ou Volume - pour analyser le centre."
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis, videoCapture)
+                statusText.text = "Prêt. Volume - : tir · Volume + : REC/STOP."
             } catch (e: Exception) {
                 statusText.text = "Erreur caméra : ${e.message ?: "inconnue"}"
             }
@@ -196,22 +266,100 @@ class MainActivity : ComponentActivity() {
         previewView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
     }
 
+    private fun toggleRecording() {
+        if (!::videoCapture.isInitialized) {
+            statusText.text = "Caméra vidéo pas encore prête."
+            return
+        }
+
+        val active = recording
+        if (active != null) {
+            if (!recordingStopping) {
+                recordingStopping = true
+                active.stop()
+                speak("stop")
+                statusText.text = "Arrêt et sauvegarde de la vidéo…"
+            }
+            return
+        }
+
+        val fileName = "WebCS-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.mp4"
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/WebCS")
+            }
+        }
+        val output = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            .setContentValues(values)
+            .build()
+
+        recordingStopping = false
+        recording = videoCapture.output
+            .prepareRecording(this, output)
+            .start(ContextCompat.getMainExecutor(this)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        recText.visibility = View.VISIBLE
+                        statusText.text = "Enregistrement MP4 en cours… Volume + pour arrêter."
+                        speak("rec")
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        recText.visibility = View.GONE
+                        recording?.close()
+                        recording = null
+                        recordingStopping = false
+                        statusText.text = if (event.hasError()) {
+                            "Erreur enregistrement : ${event.error}"
+                        } else {
+                            "Vidéo sauvegardée dans Films/WebCS."
+                        }
+                    }
+                }
+            }
+    }
+
     private fun toggleEco() {
         eco = !eco
         previewView.alpha = if (eco) 0.03f else 1f
-        ecoButton.text = if (eco) "Aperçu normal" else "Mode éco"
+        ecoButton.text = if (eco) "APERÇU NORMAL" else "MODE ÉCO"
         statusText.text = if (eco) "Mode éco : aperçu presque noir, analyse caméra toujours active." else "Aperçu normal."
     }
 
+    private fun speak(message: String) {
+        if (ttsReady) tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "webcs-$message")
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            ttsReady = true
+            tts?.language = Locale.FRENCH
+        }
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            fire()
-            return true
+        if (event?.repeatCount == 0) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                    fire()
+                    return true
+                }
+                KeyEvent.KEYCODE_VOLUME_UP -> {
+                    toggleRecording()
+                    return true
+                }
+            }
         }
         return super.onKeyDown(keyCode, event)
     }
 
     override fun onDestroy() {
+        recording?.stop()
+        recording?.close()
+        recording = null
+        tts?.stop()
+        tts?.shutdown()
         cameraExecutor.shutdown()
         super.onDestroy()
     }
