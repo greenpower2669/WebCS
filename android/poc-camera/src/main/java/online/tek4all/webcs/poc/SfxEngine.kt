@@ -1,44 +1,85 @@
 package online.tek4all.webcs.poc
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.SoundPool
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.exp
 import kotlin.math.sin
 
-class SfxEngine {
+class SfxEngine(context: Context) {
     @Volatile private var enabled = true
     @Volatile private var volume = 0.70f
-    private val executor = Executors.newFixedThreadPool(3)
+    private val executor = Executors.newFixedThreadPool(4)
     private val sampleRate = 22050
+    private val readySamples = ConcurrentHashMap.newKeySet<Int>()
+    private val appContext = context.applicationContext
 
-    private val shot by lazy { buildShot() }
+    private val soundPool = SoundPool.Builder()
+        .setMaxStreams(6)
+        .setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_GAME)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+        )
+        .build()
+
+    private val shotSampleId: Int
+    private val reloadSampleId: Int
+
+    private val shotFallback by lazy { buildShot() }
     private val empty by lazy { buildEmptyClick() }
     private val endOfMagazine by lazy { buildEndOfMagazine() }
-    private val reload by lazy { buildReload() }
+    private val reloadFallback by lazy { buildReload() }
+    private val hitReward by lazy { buildHitReward() }
+
+    init {
+        soundPool.setOnLoadCompleteListener { _, sampleId, status ->
+            if (status == 0) readySamples.add(sampleId)
+        }
+        shotSampleId = soundPool.load(appContext, R.raw.tir, 1)
+        reloadSampleId = soundPool.load(appContext, R.raw.reload, 1)
+    }
 
     fun configure(isEnabled: Boolean, volumePercent: Int) {
         enabled = isEnabled
         volume = (volumePercent.coerceIn(0, 100) / 100f)
     }
 
-    fun playShot() = play(shot)
+    fun playShot() = playSampleOrFallback(shotSampleId, shotFallback)
     fun playEmpty() = play(empty)
     fun playEndOfMagazine() = play(endOfMagazine)
-    fun playReload() = play(reload)
+    fun playReload() = playSampleOrFallback(reloadSampleId, reloadFallback)
+
+    /** Petit retour positif distinct du PAN, joué seulement sur un TOUCHÉ. */
+    fun playHitReward() = play(hitReward, delayMs = 95L)
 
     fun release() {
         executor.shutdownNow()
+        try { soundPool.release() } catch (_: Exception) { }
     }
 
-    private fun play(samples: ShortArray) {
+    private fun playSampleOrFallback(sampleId: Int, fallback: ShortArray) {
+        if (!enabled || volume <= 0f) return
+        val v = volume
+        val streamId = if (readySamples.contains(sampleId)) {
+            try { soundPool.play(sampleId, v, v, 1, 0, 1f) } catch (_: Exception) { 0 }
+        } else 0
+        if (streamId == 0) play(fallback)
+    }
+
+    private fun play(samples: ShortArray, delayMs: Long = 0L) {
         if (!enabled || volume <= 0f) return
         val playVolume = volume
         executor.execute {
             var track: AudioTrack? = null
             try {
+                if (delayMs > 0L) Thread.sleep(delayMs)
                 val bytes = ByteArray(samples.size * 2)
                 var p = 0
                 for (sample in samples) {
@@ -73,6 +114,17 @@ class SfxEngine {
                 try { track?.stop() } catch (_: Exception) { }
                 try { track?.release() } catch (_: Exception) { }
             }
+        }
+    }
+
+    private fun buildHitReward(): ShortArray {
+        val n = (sampleRate * 0.24).toInt()
+        return ShortArray(n) { i ->
+            val t = i.toDouble() / sampleRate
+            val first = sin(2.0 * PI * 1180.0 * t) * exp(-t * 20.0)
+            val t2 = (t - 0.075).coerceAtLeast(0.0)
+            val second = if (t >= 0.075) sin(2.0 * PI * 1760.0 * t2) * exp(-t2 * 18.0) else 0.0
+            ((0.60 * first + 0.78 * second) * 15000).toInt().coerceIn(-32767, 32767).toShort()
         }
     }
 
