@@ -25,6 +25,22 @@ jobs:
       - name: Apply CameraX analysis hotfix
         run: python3 tools/hotfix_camera_analysis.py
 
+      - name: Prepare v0.8 generator for v0.7 source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tools/add_context_reload_data.py')
+          t = p.read_text(encoding='utf-8')
+          old = "'''    companion object {\n        const val SAMPLE_CENTER = \"center\"\n''',"
+          new = "'''    companion object {\n        private const val WEBSC_V070 = true\n        const val SAMPLE_CENTER = \"center\"\n''',"
+          t = t.replace(old, new)
+          old = "'''    companion object {\n        private const val WEBSC_V080 = \"context-reload-data-v1\""
+          new = "'''    companion object {\n        private const val WEBSC_V070 = true\n        private const val WEBSC_V080 = \"context-reload-data-v1\""
+          t = t.replace(old, new)
+          p.write_text(t, encoding='utf-8')
+          PY
+
       - name: Add contextual reload and arbitration data
         run: python3 tools/add_context_reload_data.py
 
