@@ -49,6 +49,7 @@ import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.asin
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -62,6 +63,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         fun onRecording(active: Boolean, message: String)
         fun onStatus(message: String)
         fun onAmmo(ammo: Int, capacity: Int, reloading: Boolean)
+        fun onAimPatch(size: Int, pixels: IntArray, calibrationRemaining: Int)
     }
 
     data class CameraOption(val id: String, val label: String)
@@ -125,7 +127,9 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     private lateinit var sensorManager: SensorManager
     private var motionSensor: Sensor? = null
+    private var orientationSensor: Sensor? = null
     private var sensorRegistered = false
+    private var orientationRegistered = false
     private val gravity = FloatArray(3)
     private var gravityReady = false
     private var calibrationImpulse: MotionImpulse? = null
@@ -139,6 +143,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     private var reloadProjectionImpulse: ProjectionImpulse? = null
     private var lastReloadGestureMs = 0L
     private var lastGestureActionMs = 0L
+    private var lastCameraElevationDeg: Float? = null
+    private var upwardTurnAccumDeg = 0f
+    private var upwardTurnStartMs = 0L
+    @Volatile private var reloadGateUntilMs = 0L
 
     @Volatile private var latestResult: ScanResult? = null
     @Volatile private var calibrationRemaining = 0
@@ -148,6 +156,15 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     private var calibrationSumB = 0.0
     private var calibrationSumL = 0.0
     private var calibrationSumL2 = 0.0
+    private var targetCalibrationRemaining = 0
+    private var targetCalibrationCount = 0
+    private var targetSumR = 0.0
+    private var targetSumG = 0.0
+    private var targetSumB = 0.0
+    private var targetSumR2 = 0.0
+    private var targetSumG2 = 0.0
+    private var targetSumB2 = 0.0
+    private var patchFrameCounter = 0
 
     var listener: Listener? = null
 
@@ -164,6 +181,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         ammo = magazineSize()
         sensorManager = getSystemService(SensorManager::class.java)
         motionSensor = chooseMotionSensor()
+        orientationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
         updateSensorRegistration()
         createChannel()
         promoteToForeground(false)
@@ -330,24 +348,32 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     fun startCalibration() {
         if (latestResult == null) {
-            listener?.onStatus("Attends que la caméra fournisse une image avant l'étalonnage.")
+            listener?.onStatus("Attends une image caméra avant de calibrer la cible.")
             return
         }
-        calibrationCount = 0
-        calibrationSumR = 0.0
-        calibrationSumG = 0.0
-        calibrationSumB = 0.0
-        calibrationSumL = 0.0
-        calibrationSumL2 = 0.0
-        calibrationRemaining = 30
-        listener?.onStatus("Étalonnage caméra : 30 images. Garde le téléphone stable sur la scène de référence.")
+        targetCalibrationCount = 0
+        targetSumR = 0.0
+        targetSumG = 0.0
+        targetSumB = 0.0
+        targetSumR2 = 0.0
+        targetSumG2 = 0.0
+        targetSumB2 = 0.0
+        targetCalibrationRemaining = TARGET_CALIBRATION_SHOTS
+        speak("calibration cible")
+        listener?.onStatus("Calibration couleur ennemi : vise la cible dans le zoom central puis tire 10 fois dessus.")
     }
 
     fun calibrationSummary(): String {
-        val s = currentSettings()
-        return prefs.getString("calibration.${s.profileId}", null)
-            ?: "Profil ${s.profileId} : pas encore étalonné"
+        val id = currentSettings().profileId
+        if (!prefs.contains("target.$id.r")) return "Couleur ennemi $id : non calibrée · bleu historique utilisé"
+        val r = prefs.getInt("target.$id.r", 0)
+        val g = prefs.getInt("target.$id.g", 0)
+        val b = prefs.getInt("target.$id.b", 0)
+        val tolerance = prefs.getFloat("target.$id.tolerance", 42f)
+        return "Couleur ennemi $id · RGB $r/$g/$b · tolérance ${tolerance.roundToInt()} · $TARGET_CALIBRATION_SHOTS tirs"
     }
+
+    fun isTargetCalibrationActive(): Boolean = targetCalibrationRemaining > 0
 
     fun startGestureCalibration() {
         calibratingReloadGesture = false
@@ -411,6 +437,11 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val result = latestResult
         if (result == null) {
             listener?.onStatus("Pas encore d'image exploitable.")
+            return
+        }
+        if (targetCalibrationRemaining > 0) {
+            sfx.playShot()
+            recordTargetCalibrationShot(result)
             return
         }
         if (ammo <= 0) {
@@ -682,14 +713,15 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val points = offsets.map { (dx, dy) -> sample(image, cx + dx, cy + dy) }
         val centerOnly = prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) == SAMPLE_CENTER
         val used = if (centerOnly) listOf(points.first()) else points
-        val blueVotes = used.count { it.isBlue }
+        val targetVotes = used.count { matchesTarget(it.r, it.g, it.b) }
         val avgR = used.sumOf { it.r } / used.size
         val avgG = used.sumOf { it.g } / used.size
         val avgB = used.sumOf { it.b } / used.size
         val hsv = FloatArray(3)
         Color.RGBToHSV(avgR, avgG, avgB, hsv)
-        val hit = if (centerOnly) blueVotes == 1 else blueVotes >= 3
-        return ScanResult(hit, blueVotes, used.size, avgR, avgG, avgB, hsv[0], hsv[1], hsv[2])
+        val hit = if (centerOnly) targetVotes == 1 else targetVotes >= 3
+        maybePublishAimPatch(image, cx, cy)
+        return ScanResult(hit, targetVotes, used.size, avgR, avgG, avgB, hsv[0], hsv[1], hsv[2])
     }
 
     private fun sample(image: ImageProxy, x0: Int, y0: Int): PointSample {
@@ -715,6 +747,76 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         return PointSample(r, g, b, blue)
     }
 
+    private fun matchesTarget(r: Int, g: Int, b: Int): Boolean {
+        val id = currentSettings().profileId
+        if (!prefs.contains("target.$id.r")) {
+            val hsv = FloatArray(3)
+            Color.RGBToHSV(r, g, b, hsv)
+            return hsv[0] in 185f..255f && hsv[1] >= 0.22f && hsv[2] >= 0.10f
+        }
+        val tr = prefs.getInt("target.$id.r", 0)
+        val tg = prefs.getInt("target.$id.g", 0)
+        val tb = prefs.getInt("target.$id.b", 0)
+        val tolerance = prefs.getFloat("target.$id.tolerance", 42f)
+        val dr = (r - tr).toFloat()
+        val dg = (g - tg).toFloat()
+        val db = (b - tb).toFloat()
+        return sqrt(dr * dr + dg * dg + db * db) <= tolerance
+    }
+
+    private fun recordTargetCalibrationShot(result: ScanResult) {
+        if (targetCalibrationRemaining <= 0) return
+        targetCalibrationCount++
+        targetSumR += result.r
+        targetSumG += result.g
+        targetSumB += result.b
+        targetSumR2 += result.r.toDouble() * result.r
+        targetSumG2 += result.g.toDouble() * result.g
+        targetSumB2 += result.b.toDouble() * result.b
+        targetCalibrationRemaining--
+        val done = TARGET_CALIBRATION_SHOTS - targetCalibrationRemaining
+        if (targetCalibrationRemaining > 0) {
+            listener?.onStatus("Couleur ennemi : tir $done/$TARGET_CALIBRATION_SHOTS enregistré · garde le centre sur la cible.")
+            speak(done.toString())
+            return
+        }
+        val n = targetCalibrationCount.toDouble().coerceAtLeast(1.0)
+        val mr = targetSumR / n
+        val mg = targetSumG / n
+        val mb = targetSumB / n
+        val sr = sqrt((targetSumR2 / n - mr * mr).coerceAtLeast(0.0))
+        val sg = sqrt((targetSumG2 / n - mg * mg).coerceAtLeast(0.0))
+        val sb = sqrt((targetSumB2 / n - mb * mb).coerceAtLeast(0.0))
+        val tolerance = max(32.0, sqrt(sr * sr + sg * sg + sb * sb) * 3.0).coerceAtMost(120.0).toFloat()
+        val id = currentSettings().profileId
+        prefs.edit()
+            .putInt("target.$id.r", mr.roundToInt())
+            .putInt("target.$id.g", mg.roundToInt())
+            .putInt("target.$id.b", mb.roundToInt())
+            .putFloat("target.$id.tolerance", tolerance)
+            .apply()
+        speak("couleur ennemi calibrée")
+        listener?.onStatus("Couleur ennemi calibrée · RGB ${mr.roundToInt()}/${mg.roundToInt()}/${mb.roundToInt()} · tolérance ${tolerance.roundToInt()}.")
+    }
+
+    private fun maybePublishAimPatch(image: ImageProxy, cx: Int, cy: Int) {
+        patchFrameCounter++
+        if (patchFrameCounter % 4 != 0) return
+        val half = AIM_PATCH_SIZE / 2
+        val pixels = IntArray(AIM_PATCH_SIZE * AIM_PATCH_SIZE)
+        var index = 0
+        for (dy in -half..half) {
+            for (dx in -half..half) {
+                val p = sample(image, cx + dx, cy + dy)
+                pixels[index++] = Color.rgb(p.r, p.g, p.b)
+            }
+        }
+        val remaining = targetCalibrationRemaining
+        ContextCompat.getMainExecutor(this).execute {
+            listener?.onAimPatch(AIM_PATCH_SIZE, pixels, remaining)
+        }
+    }
+
     private fun consumeCalibration(result: ScanResult) {
         if (calibrationRemaining <= 0) return
         calibrationCount++
@@ -736,6 +838,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
+            handleOrientation(event)
+            return
+        }
         val vector = motionVector(event) ?: return
         val now = SystemClock.elapsedRealtime()
         val x = vector[0]
@@ -755,6 +861,43 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    private fun handleOrientation(event: SensorEvent) {
+        if (event.values.isEmpty()) return
+        val rotation = FloatArray(9)
+        try {
+            SensorManager.getRotationMatrixFromVector(rotation, event.values)
+        } catch (_: Exception) {
+            return
+        }
+        // La caméra arrière regarde approximativement selon -Z du téléphone.
+        // La composante verticale de ce vecteur donne une élévation indépendante du roulis.
+        val forwardZ = (-rotation[8]).coerceIn(-1f, 1f)
+        val elevation = Math.toDegrees(asin(forwardZ.toDouble())).toFloat()
+        val now = SystemClock.elapsedRealtime()
+        val previous = lastCameraElevationDeg
+        lastCameraElevationDeg = elevation
+        if (previous == null) return
+        val delta = elevation - previous
+        if (upwardTurnStartMs == 0L || now - upwardTurnStartMs > UPWARD_TURN_WINDOW_MS) {
+            upwardTurnStartMs = now
+            upwardTurnAccumDeg = 0f
+        }
+        if (delta > 0.4f) {
+            upwardTurnAccumDeg += delta
+        } else if (delta < -2.5f) {
+            upwardTurnAccumDeg = 0f
+            upwardTurnStartMs = now
+        }
+        if (upwardTurnAccumDeg >= UPWARD_TURN_MIN_DEG && now - upwardTurnStartMs <= UPWARD_TURN_WINDOW_MS) {
+            reloadGateUntilMs = now + RELOAD_GATE_MS
+            upwardTurnAccumDeg = 0f
+            upwardTurnStartMs = now
+            if (prefs.getBoolean(PREF_RELOAD_GESTURE_ENABLED, false)) {
+                notifyStatus("Arme relevée · geste de recharge autorisé pendant 5 s.")
+            }
+        }
+    }
 
     private fun motionVector(event: SensorEvent): FloatArray? {
         if (event.values.size < 3) return null
@@ -889,6 +1032,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     private fun handleReloadGestureDetection(now: Long, x: Float, y: Float, z: Float) {
+        if (now > reloadGateUntilMs) {
+            reloadProjectionImpulse = null
+            return
+        }
         if (now - lastReloadGestureMs < RELOAD_GESTURE_COOLDOWN_MS || now - lastGestureActionMs < GESTURE_ACTION_GUARD_MS) return
         val ax = prefs.getFloat(PREF_RELOAD_GESTURE_AXIS_X, 0f)
         val ay = prefs.getFloat(PREF_RELOAD_GESTURE_AXIS_Y, 0f)
@@ -908,6 +1055,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         }
         if (dt >= RELOAD_GESTURE_MIN_PAIR_MS && first.value * projection < 0f && abs(projection) >= threshold * 0.55f) {
             reloadProjectionImpulse = null
+            reloadGateUntilMs = 0L
             lastReloadGestureMs = now
             lastGestureActionMs = now
             mainHandler.post { reloadMagazine() }
@@ -924,14 +1072,24 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     private fun updateSensorRegistration(force: Boolean = false) {
-        val shouldRun = force || gestureCalibrationRemaining > 0 || prefs.getBoolean(PREF_GESTURE_ENABLED, false) || prefs.getBoolean(PREF_RELOAD_GESTURE_ENABLED, false)
+        val reloadEnabled = prefs.getBoolean(PREF_RELOAD_GESTURE_ENABLED, false) || calibratingReloadGesture
+        val shouldRun = force || gestureCalibrationRemaining > 0 || prefs.getBoolean(PREF_GESTURE_ENABLED, false) || reloadEnabled
         if (shouldRun && !sensorRegistered) {
             motionSensor?.let {
                 sensorRegistered = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
                 if (sensorRegistered && !it.isWakeUpSensor) acquireGestureWakeLock()
             }
-        } else if (!shouldRun && sensorRegistered) {
-            sensorManager.unregisterListener(this)
+        }
+        if (shouldRun && reloadEnabled && !orientationRegistered) {
+            orientationSensor?.let {
+                orientationRegistered = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            }
+        } else if ((!reloadEnabled || !shouldRun) && orientationRegistered) {
+            orientationSensor?.let { sensorManager.unregisterListener(this, it) }
+            orientationRegistered = false
+        }
+        if (!shouldRun && sensorRegistered) {
+            motionSensor?.let { sensorManager.unregisterListener(this, it) }
             sensorRegistered = false
             releaseGestureWakeLock()
         }
@@ -1084,8 +1242,9 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         listener = null
         reloading = false
         stopRecordingNow()
-        if (sensorRegistered) sensorManager.unregisterListener(this)
+        if (sensorRegistered || orientationRegistered) sensorManager.unregisterListener(this)
         sensorRegistered = false
+        orientationRegistered = false
         releaseRecordingWakeLock()
         releaseGestureWakeLock()
         cameraProvider?.unbindAll()
@@ -1100,6 +1259,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     data class ScanResult(val hit: Boolean, val blueVotes: Int, val total: Int, val r: Int, val g: Int, val b: Int, val h: Float, val s: Float, val v: Float)
 
     companion object {
+        private const val WEBSC_V070 = true
         const val SAMPLE_CENTER = "center"
         const val SAMPLE_FIVE = "five"
         private const val PREF_CAMERA_ID = "camera.id"
@@ -1132,6 +1292,11 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         private const val RELOAD_GESTURE_MIN_PAIR_MS = 90L
         private const val RELOAD_GESTURE_MAX_PAIR_MS = 620L
         private const val RELOAD_GESTURE_COOLDOWN_MS = 1200L
+        private const val UPWARD_TURN_MIN_DEG = 20f
+        private const val UPWARD_TURN_WINDOW_MS = 800L
+        private const val RELOAD_GATE_MS = 5000L
+        private const val TARGET_CALIBRATION_SHOTS = 10
+        private const val AIM_PATCH_SIZE = 11
         private const val CALIBRATION_MIN_ACCEL = 3.0f
         private const val RELOAD_DURATION_MS = 1250L
         private const val MIN_RECORDING_MS = 850L

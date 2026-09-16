@@ -44,6 +44,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var ammoText: TextView
     private lateinit var ecoButton: Button
     private lateinit var recText: TextView
+    private lateinit var aimZoomView: AimZoomView
 
     private var cameraService: CameraForegroundService? = null
     private var isBound = false
@@ -80,6 +81,11 @@ class MainActivity : ComponentActivity() {
 
         override fun onAmmo(ammo: Int, capacity: Int, reloading: Boolean) {
             ammoText.text = if (reloading) "Chargeur $ammo/$capacity · rechargement…" else "Chargeur $ammo/$capacity"
+        }
+
+        override fun onAimPatch(size: Int, pixels: IntArray, calibrationRemaining: Int) {
+            aimZoomView.setPatch(size, pixels, calibrationRemaining)
+            aimZoomView.visibility = if (calibrationRemaining > 0) View.VISIBLE else View.GONE
         }
     }
 
@@ -150,6 +156,14 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(previewView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         root.addView(CrosshairView(this), FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+        aimZoomView = AimZoomView(this).apply {
+            visibility = View.GONE
+            contentDescription = "Zoom des pixels centraux pour calibrer la couleur ennemi"
+        }
+        val zoomParams = FrameLayout.LayoutParams(dp(176), dp(176), Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+        zoomParams.setMargins(0, dp(76), 0, 0)
+        root.addView(aimZoomView, zoomParams)
 
         val settingsButton = Button(this).apply {
             text = "⚙"
@@ -345,7 +359,7 @@ class MainActivity : ComponentActivity() {
         content.addView(gestureCalibrateButton)
 
         val reloadGestureCheck = CheckBox(this).apply {
-            text = "Recharger avec un geste calibré"
+            text = "Recharger par geste après avoir relevé l'arme (fenêtre 5 s)"
             isChecked = snapshot.reloadGestureEnabled
         }
         content.addView(reloadGestureCheck)
@@ -362,8 +376,9 @@ class MainActivity : ComponentActivity() {
 
         val profileText = label(service.calibrationSummary())
         content.addView(profileText)
+        content.addView(label("Calibration optionnelle : vise la couleur ennemi dans le zoom central et déclenche 10 tirs. Elle remplace le bleu historique pour ce profil caméra/résolution."))
 
-        val calibrateButton = Button(this).apply { text = "ÉTALONNER CE PROFIL CAMÉRA" }
+        val calibrateButton = Button(this).apply { text = "CALIBRER COULEUR ENNEMI · 10 TIRS" }
         content.addView(calibrateButton)
 
         val quitButton = Button(this).apply {
@@ -523,6 +538,57 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
+
+    class AimZoomView(context: Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+        private val cross = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 28f
+        }
+        private var patchSize = 0
+        private var pixels = IntArray(0)
+        private var remaining = 0
+
+        fun setPatch(size: Int, values: IntArray, calibrationRemaining: Int) {
+            patchSize = size
+            pixels = values.copyOf()
+            remaining = calibrationRemaining
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            canvas.drawColor(Color.argb(210, 0, 0, 0))
+            if (patchSize > 0 && pixels.size >= patchSize * patchSize) {
+                val cellW = width.toFloat() / patchSize
+                val cellH = height.toFloat() / patchSize
+                var i = 0
+                for (y in 0 until patchSize) {
+                    for (x in 0 until patchSize) {
+                        paint.color = pixels[i++]
+                        paint.style = Paint.Style.FILL
+                        canvas.drawRect(x * cellW, y * cellH, (x + 1) * cellW + 1f, (y + 1) * cellH + 1f, paint)
+                    }
+                }
+            }
+            canvas.drawRect(1f, 1f, width - 1f, height - 1f, border)
+            val cx = width / 2f
+            val cy = height / 2f
+            canvas.drawLine(cx - 26f, cy, cx + 26f, cy, cross)
+            canvas.drawLine(cx, cy - 26f, cx, cy + 26f, cross)
+            if (remaining > 0) canvas.drawText("CIBLE ${11 - remaining}/10", 8f, 30f, textPaint)
+        }
+    }
 
     class CrosshairView(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
