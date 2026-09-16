@@ -8,6 +8,7 @@ on:
       - 'settings.gradle.kts'
       - 'gradle.properties'
       - 'tools/hotfix_camera_analysis.py'
+      - 'tools/add_reload_gesture.py'
       - '.github/workflows/android-apk.yml'
   workflow_dispatch:
 
@@ -24,14 +25,17 @@ jobs:
       - name: Apply CameraX analysis hotfix
         run: python3 tools/hotfix_camera_analysis.py
 
-      - name: Commit hotfix source if needed
+      - name: Add calibrated reload gesture
+        run: python3 tools/add_reload_gesture.py
+
+      - name: Commit generated source changes if needed
         shell: bash
         run: |
-          if ! git diff --quiet -- android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt; then
+          if ! git diff --quiet -- android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/MainActivity.kt; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt
-            git commit -m "Fix CameraX analysis stream readiness"
+            git add android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/MainActivity.kt
+            git commit -m "Add accelerometer reload gesture"
             git push
           fi
 
@@ -52,6 +56,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: WebCS-v0.5.1-debug-apk
+          name: WebCS-v0.6.0-debug-apk
           path: android/poc-camera/build/outputs/apk/debug/poc-camera-debug.apk
           if-no-files-found: error
