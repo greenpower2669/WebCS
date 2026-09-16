@@ -8,11 +8,19 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
+import android.net.Uri
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.util.Size
@@ -40,18 +48,20 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 @OptIn(ExperimentalCamera2Interop::class)
-class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener {
+class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener, SensorEventListener {
     interface Listener {
         fun onReady(score: Int, recording: Boolean)
         fun onShot(hit: Boolean, votes: Int, total: Int, score: Int, details: String)
         fun onRecording(active: Boolean, message: String)
         fun onStatus(message: String)
+        fun onAmmo(ammo: Int, capacity: Int, reloading: Boolean)
     }
 
     data class CameraOption(val id: String, val label: String)
@@ -67,12 +77,29 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         val effectiveHeight: Int,
         val sampleMode: String,
         val videoQuality: String,
-        val profileId: String
+        val profileId: String,
+        val sfxEnabled: Boolean,
+        val sfxVolume: Int,
+        val gestureEnabled: Boolean,
+        val gestureSensitivity: Int,
+        val magazineSize: Int,
+        val gestureCalibrated: Boolean
     )
+
+    private data class MotionImpulse(
+        val x: Float,
+        val y: Float,
+        val z: Float,
+        val magnitude: Float,
+        val timeMs: Long
+    )
+
+    private data class ProjectionImpulse(val value: Float, val timeMs: Long)
 
     inner class LocalBinder : Binder() { fun getService(): CameraForegroundService = this@CameraForegroundService }
 
     private val binder = LocalBinder()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var cameraExecutor: ExecutorService
     private var cameraProvider: ProcessCameraProvider? = null
     private var previewUseCase: Preview? = null
@@ -80,12 +107,32 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
     private lateinit var videoCapture: VideoCapture<Recorder>
     private var recording: Recording? = null
     private var recordingStopping = false
+    private var recordingHasData = false
+    private var pendingStopAfterData = false
+    private var recordingStartMs = 0L
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var wakeLock: PowerManager.WakeLock? = null
+    private var recordingWakeLock: PowerManager.WakeLock? = null
+    private var gestureWakeLock: PowerManager.WakeLock? = null
+    private lateinit var sfx: SfxEngine
     private var score = 0
     private var effectiveWidth = 0
     private var effectiveHeight = 0
+    private var ammo = 0
+    private var reloading = false
+
+    private lateinit var sensorManager: SensorManager
+    private var motionSensor: Sensor? = null
+    private var sensorRegistered = false
+    private val gravity = FloatArray(3)
+    private var gravityReady = false
+    private var calibrationImpulse: MotionImpulse? = null
+    private val gestureCalibrationAxes = mutableListOf<FloatArray>()
+    private val gestureCalibrationPeaks = mutableListOf<Float>()
+    private var gestureCalibrationRemaining = 0
+    private var lastCalibrationPairMs = 0L
+    private var projectionImpulse: ProjectionImpulse? = null
+    private var lastGestureShotMs = 0L
 
     @Volatile private var latestResult: ScanResult? = null
     @Volatile private var calibrationRemaining = 0
@@ -105,6 +152,13 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         score = prefs.getInt("score", 0)
         cameraExecutor = Executors.newSingleThreadExecutor()
         tts = TextToSpeech(this, this)
+        sfx = SfxEngine().also {
+            it.configure(prefs.getBoolean(PREF_SFX_ENABLED, true), prefs.getInt(PREF_SFX_VOLUME, 70))
+        }
+        ammo = magazineSize()
+        sensorManager = getSystemService(SensorManager::class.java)
+        motionSensor = chooseMotionSensor()
+        updateSensorRegistration()
         createChannel()
         promoteToForeground(false)
         startCameraCore()
@@ -118,9 +172,9 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
-            ACTION_STOP_RECORDING -> stopRecording()
+            ACTION_STOP_RECORDING -> requestStopRecording()
             ACTION_STOP_SERVICE -> {
-                stopRecording()
+                stopRecordingNow()
                 stopSelf()
             }
         }
@@ -139,6 +193,9 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
 
     fun isRecording(): Boolean = recording != null
     fun currentScore(): Int = score
+    fun currentAmmo(): Int = ammo
+    fun currentMagazineSize(): Int = magazineSize()
+    fun isReloading(): Boolean = reloading
 
     fun currentSettings(): SettingsSnapshot {
         val cameraId = selectedCameraId()
@@ -146,14 +203,30 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         val h = prefs.getInt(PREF_HEIGHT, 480)
         val mode = prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) ?: SAMPLE_FIVE
         val quality = prefs.getString(PREF_VIDEO_QUALITY, "AUTO") ?: "AUTO"
-        return SettingsSnapshot(cameraId, w, h, effectiveWidth, effectiveHeight, mode, quality, profileId(cameraId, w, h, mode))
+        return SettingsSnapshot(
+            cameraId = cameraId,
+            requestedWidth = w,
+            requestedHeight = h,
+            effectiveWidth = effectiveWidth,
+            effectiveHeight = effectiveHeight,
+            sampleMode = mode,
+            videoQuality = quality,
+            profileId = profileId(cameraId, w, h, mode),
+            sfxEnabled = prefs.getBoolean(PREF_SFX_ENABLED, true),
+            sfxVolume = prefs.getInt(PREF_SFX_VOLUME, 70),
+            gestureEnabled = prefs.getBoolean(PREF_GESTURE_ENABLED, false),
+            gestureSensitivity = prefs.getInt(PREF_GESTURE_SENSITIVITY, 60),
+            magazineSize = magazineSize(),
+            gestureCalibrated = hasGestureCalibration()
+        )
     }
 
     fun configurationSummary(): String {
         val s = currentSettings()
         val effective = if (s.effectiveWidth > 0) "${s.effectiveWidth}×${s.effectiveHeight}" else "en attente"
         val mode = if (s.sampleMode == SAMPLE_CENTER) "centre" else "5 points"
-        return "Cam ${s.cameraId} · demandé ${s.requestedWidth}×${s.requestedHeight} · effectif $effective · $mode · vidéo ${s.videoQuality}"
+        val motion = if (s.gestureEnabled) " · geste ON" else ""
+        return "Cam ${s.cameraId} · demandé ${s.requestedWidth}×${s.requestedHeight} · effectif $effective · $mode · vidéo ${s.videoQuality}$motion"
     }
 
     fun getCameraOptions(): List<CameraOption> {
@@ -188,29 +261,56 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         val info = findCameraInfo(cameraId) ?: return listOf(QualityOption("AUTO", "Auto"))
         val supported = QualitySelector.getSupportedQualities(info)
         val result = mutableListOf(QualityOption("AUTO", "Auto (meilleure disponible)"))
-        supported.forEach { q ->
-            qualityKey(q)?.let { key -> result.add(QualityOption(key, key)) }
-        }
+        supported.forEach { q -> qualityKey(q)?.let { key -> result.add(QualityOption(key, key)) } }
         return result.distinctBy { it.key }
     }
 
-    fun applySettings(cameraId: String, width: Int, height: Int, sampleMode: String, videoQuality: String): Boolean {
+    fun applySettings(
+        cameraId: String,
+        width: Int,
+        height: Int,
+        sampleMode: String,
+        videoQuality: String,
+        sfxEnabled: Boolean,
+        sfxVolume: Int,
+        gestureEnabled: Boolean,
+        gestureSensitivity: Int,
+        magazineSize: Int
+    ): Boolean {
         if (recording != null) {
-            listener?.onStatus("Arrête le REC avant de changer de caméra ou de résolution.")
+            listener?.onStatus("Arrête le REC avant de changer les réglages.")
             return false
         }
+        val oldCamera = selectedCameraId()
+        val oldWidth = prefs.getInt(PREF_WIDTH, 640)
+        val oldHeight = prefs.getInt(PREF_HEIGHT, 480)
+        val oldQuality = prefs.getString(PREF_VIDEO_QUALITY, "AUTO") ?: "AUTO"
+        val oldMag = magazineSize()
         prefs.edit()
             .putString(PREF_CAMERA_ID, cameraId)
             .putInt(PREF_WIDTH, width)
             .putInt(PREF_HEIGHT, height)
             .putString(PREF_SAMPLE_MODE, if (sampleMode == SAMPLE_CENTER) SAMPLE_CENTER else SAMPLE_FIVE)
             .putString(PREF_VIDEO_QUALITY, videoQuality)
+            .putBoolean(PREF_SFX_ENABLED, sfxEnabled)
+            .putInt(PREF_SFX_VOLUME, sfxVolume.coerceIn(0, 100))
+            .putBoolean(PREF_GESTURE_ENABLED, gestureEnabled && hasGestureCalibration())
+            .putInt(PREF_GESTURE_SENSITIVITY, gestureSensitivity.coerceIn(0, 100))
+            .putInt(PREF_MAGAZINE_SIZE, magazineSize.coerceIn(1, 99))
             .apply()
-        effectiveWidth = 0
-        effectiveHeight = 0
-        latestResult = null
-        rebindCamera()
-        listener?.onStatus("Réglages appliqués · $cameraId · ${width}×${height} · ${if (sampleMode == SAMPLE_CENTER) "centre" else "5 points"}.")
+        sfx.configure(sfxEnabled, sfxVolume)
+        if (oldMag != magazineSize()) ammo = magazineSize()
+        updateSensorRegistration()
+        notifyAmmo()
+        val cameraChanged = oldCamera != cameraId || oldWidth != width || oldHeight != height || oldQuality != videoQuality
+        if (cameraChanged) {
+            effectiveWidth = 0
+            effectiveHeight = 0
+            latestResult = null
+            rebindCamera()
+        }
+        val gestureNote = if (gestureEnabled && !hasGestureCalibration()) " · geste à calibrer" else ""
+        listener?.onStatus("Réglages appliqués · $cameraId · ${width}×${height} · ${if (sampleMode == SAMPLE_CENTER) "centre" else "5 points"}$gestureNote.")
         return true
     }
 
@@ -226,7 +326,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         calibrationSumL = 0.0
         calibrationSumL2 = 0.0
         calibrationRemaining = 30
-        listener?.onStatus("Étalonnage : 30 images en cours. Garde le téléphone stable sur la scène de référence.")
+        listener?.onStatus("Étalonnage caméra : 30 images. Garde le téléphone stable sur la scène de référence.")
     }
 
     fun calibrationSummary(): String {
@@ -235,24 +335,87 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
             ?: "Profil ${s.profileId} : pas encore étalonné"
     }
 
+    fun startGestureCalibration() {
+        if (motionSensor == null) {
+            listener?.onStatus("Aucun accéléromètre exploitable sur cet appareil.")
+            return
+        }
+        gestureCalibrationAxes.clear()
+        gestureCalibrationPeaks.clear()
+        gestureCalibrationRemaining = GESTURE_CALIBRATION_COUNT
+        calibrationImpulse = null
+        projectionImpulse = null
+        lastCalibrationPairMs = 0L
+        updateSensorRegistration(force = true)
+        speak("calibration mouvement")
+        listener?.onStatus("Calibration tir : tiens le téléphone comme en jeu puis fais 5 à-coups rapides avant-arrière ou bas-haut.")
+    }
+
+    fun gestureCalibrationSummary(): String {
+        val sensor = motionSensor ?: return "Mouvement : aucun accéléromètre disponible"
+        if (!hasGestureCalibration()) return "Mouvement : ${sensor.name} · geste non calibré"
+        val threshold = prefs.getFloat(PREF_GESTURE_THRESHOLD, 0f)
+        val wake = if (sensor.isWakeUpSensor) "wake-up" else "service actif"
+        return "Mouvement : calibré · seuil ${String.format(Locale.US, "%.1f", threshold)} m/s² · capteur $wake"
+    }
+
     fun shutdown() {
-        stopRecording()
+        stopRecordingNow()
         stopSelf()
     }
 
     fun fire() {
+        if (reloading) {
+            listener?.onStatus("Rechargement en cours…")
+            return
+        }
         val result = latestResult
         if (result == null) {
             listener?.onStatus("Pas encore d'image exploitable.")
             return
         }
+        if (ammo <= 0) {
+            sfx.playEmpty()
+            listener?.onStatus("Clic · chargeur vide. Recharge.")
+            notifyAmmo()
+            return
+        }
+        ammo--
+        sfx.playShot()
         if (result.hit) {
             score++
             prefs.edit().putInt("score", score).apply()
         }
         val mode = if (result.total == 1) "centre" else "5 points"
-        val details = "RGB ${result.r}/${result.g}/${result.b}   HSV ${result.h.roundToInt()}°/${(result.s * 100).roundToInt()}%/${(result.v * 100).roundToInt()}% · $mode · ${effectiveWidth}×${effectiveHeight}"
+        val details = "RGB ${result.r}/${result.g}/${result.b}   HSV ${result.h.roundToInt()}°/${(result.s * 100).roundToInt()}%/${(result.v * 100).roundToInt()}% · $mode · ${effectiveWidth}×${effectiveHeight} · munitions $ammo/${magazineSize()}"
         listener?.onShot(result.hit, result.blueVotes, result.total, score, details)
+        notifyAmmo()
+        if (ammo == 0) {
+            mainHandler.postDelayed({
+                sfx.playEndOfMagazine()
+                listener?.onStatus("Chargeur vide · RECHARGER.")
+            }, 120L)
+        }
+    }
+
+    fun reloadMagazine() {
+        if (reloading) return
+        val capacity = magazineSize()
+        if (ammo >= capacity) {
+            listener?.onStatus("Chargeur déjà plein · $ammo/$capacity.")
+            return
+        }
+        reloading = true
+        sfx.playReload()
+        notifyAmmo()
+        listener?.onStatus("Rechargement…")
+        mainHandler.postDelayed({
+            if (!reloading) return@postDelayed
+            ammo = magazineSize()
+            reloading = false
+            notifyAmmo()
+            listener?.onStatus("Rechargé · $ammo/${magazineSize()}.")
+        }, RELOAD_DURATION_MS)
     }
 
     fun toggleRecording() {
@@ -261,7 +424,11 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
             return
         }
         if (recording != null) {
-            stopRecording()
+            requestStopRecording()
+            return
+        }
+        if (latestResult == null || effectiveWidth <= 0) {
+            listener?.onStatus("Attends une image caméra valide avant de lancer REC.")
             return
         }
 
@@ -276,37 +443,101 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
             .build()
 
         recordingStopping = false
+        recordingHasData = false
+        pendingStopAfterData = false
+        recordingStartMs = SystemClock.elapsedRealtime()
+        listener?.onStatus("Préparation REC…")
         recording = videoCapture.output
             .prepareRecording(this, output)
             .start(ContextCompat.getMainExecutor(this)) { event ->
                 when (event) {
                     is VideoRecordEvent.Start -> {
-                        acquireWakeLock()
+                        acquireRecordingWakeLock()
                         promoteToForeground(true)
                         speak("rec")
-                        listener?.onRecording(true, "Enregistrement MP4 actif · écran éteint autorisé.")
+                        listener?.onRecording(true, "REC actif · attends au moins une seconde avant STOP.")
                     }
-                    is VideoRecordEvent.Finalize -> {
-                        releaseWakeLock()
-                        recording?.close()
-                        recording = null
-                        recordingStopping = false
-                        promoteToForeground(false)
-                        val message = if (event.hasError()) "Erreur enregistrement : ${event.error}" else "Vidéo sauvegardée dans Films/WebCS."
-                        listener?.onRecording(false, message)
+                    is VideoRecordEvent.Status -> {
+                        if (event.recordingStats.recordedDurationNanos >= MIN_VALID_RECORDING_NS) {
+                            recordingHasData = true
+                            if (pendingStopAfterData) stopRecordingNow()
+                        }
                     }
+                    is VideoRecordEvent.Finalize -> handleRecordingFinalize(event)
                 }
             }
     }
 
-    private fun stopRecording() {
+    private fun requestStopRecording() {
+        val active = recording ?: return
+        if (recordingStopping) return
+        val elapsed = SystemClock.elapsedRealtime() - recordingStartMs
+        if (recordingHasData && elapsed >= MIN_RECORDING_MS) {
+            stopRecordingNow()
+        } else {
+            pendingStopAfterData = true
+            listener?.onStatus("STOP demandé · finalisation dès la première trame vidéo valide…")
+            val wait = (MIN_RECORDING_MS - elapsed).coerceAtLeast(250L)
+            mainHandler.postDelayed({
+                if (recording === active && pendingStopAfterData && !recordingStopping) stopRecordingNow()
+            }, wait + 450L)
+        }
+    }
+
+    private fun stopRecordingNow() {
         val active = recording ?: return
         if (!recordingStopping) {
             recordingStopping = true
+            pendingStopAfterData = false
             active.stop()
             speak("stop")
             listener?.onStatus("Arrêt et sauvegarde de la vidéo…")
         }
+    }
+
+    private fun handleRecordingFinalize(event: VideoRecordEvent.Finalize) {
+        releaseRecordingWakeLock()
+        recording?.close()
+        recording = null
+        recordingStopping = false
+        recordingHasData = false
+        pendingStopAfterData = false
+        promoteToForeground(false)
+        if (!event.hasError()) {
+            listener?.onRecording(false, "Vidéo sauvegardée dans Films/WebCS.")
+            return
+        }
+
+        val uri = event.outputResults.outputUri
+        if (event.error == VideoRecordEvent.Finalize.ERROR_NO_VALID_DATA ||
+            event.error == VideoRecordEvent.Finalize.ERROR_ENCODING_FAILED ||
+            event.error == VideoRecordEvent.Finalize.ERROR_RECORDER_ERROR) {
+            deleteInvalidRecording(uri)
+        }
+        val message = recordingErrorMessage(event.error)
+        listener?.onRecording(false, message)
+        if (event.error == VideoRecordEvent.Finalize.ERROR_NO_VALID_DATA ||
+            event.error == VideoRecordEvent.Finalize.ERROR_RECORDER_ERROR ||
+            event.error == VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) {
+            mainHandler.postDelayed({
+                if (recording == null) rebindCamera()
+            }, 350L)
+        }
+    }
+
+    private fun recordingErrorMessage(error: Int): String = when (error) {
+        VideoRecordEvent.Finalize.ERROR_NO_VALID_DATA -> "REC annulé : aucune trame vidéo valide. Caméra réinitialisée, réessaie après une seconde."
+        VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE -> "REC interrompu : la source caméra s'est arrêtée. Caméra réinitialisée."
+        VideoRecordEvent.Finalize.ERROR_INSUFFICIENT_STORAGE -> "REC impossible : stockage insuffisant."
+        VideoRecordEvent.Finalize.ERROR_ENCODING_FAILED -> "REC impossible : erreur d'encodage vidéo. Fichier invalide supprimé."
+        VideoRecordEvent.Finalize.ERROR_RECORDER_ERROR -> "REC impossible : encodeur à réinitialiser. Caméra réinitialisée."
+        VideoRecordEvent.Finalize.ERROR_INVALID_OUTPUT_OPTIONS -> "REC impossible : destination vidéo invalide."
+        else -> "REC interrompu (code $error)."
+    }
+
+    private fun deleteInvalidRecording(uri: Uri) {
+        if (uri == Uri.EMPTY) return
+        try { contentResolver.delete(uri, null, null) } catch (_: Exception) { }
     }
 
     private fun startCameraCore() {
@@ -324,6 +555,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
 
     private fun rebindCamera() {
         val provider = cameraProvider ?: return
+        if (recording != null) return
         try {
             provider.unbindAll()
             previewUseCase = null
@@ -343,14 +575,17 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
             analysis.setAnalyzer(cameraExecutor) { image ->
-                if (effectiveWidth != image.width || effectiveHeight != image.height) {
-                    effectiveWidth = image.width
-                    effectiveHeight = image.height
-                    notifyStatus("Résolution d'analyse effective : ${image.width}×${image.height} · caméra $selectedId")
+                try {
+                    if (effectiveWidth != image.width || effectiveHeight != image.height) {
+                        effectiveWidth = image.width
+                        effectiveHeight = image.height
+                        notifyStatus("Résolution d'analyse effective : ${image.width}×${image.height} · caméra $selectedId")
+                    }
+                    latestResult = analyse(image)
+                    latestResult?.let { consumeCalibration(it) }
+                } finally {
+                    image.close()
                 }
-                latestResult = analyse(image)
-                latestResult?.let { consumeCalibration(it) }
-                image.close()
             }
 
             val quality = selectedQuality(info)
@@ -360,6 +595,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
             provider.bindToLifecycle(this, selector, analysis, videoCapture)
             bindPreviewOnly()
             listener?.onReady(score, isRecording())
+            notifyAmmo()
         } catch (e: Exception) {
             listener?.onStatus("Erreur réglage caméra : ${e.message ?: "inconnue"}")
         }
@@ -388,7 +624,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         val gap = max(2, (min(image.width, image.height) * 0.008f).roundToInt())
         val offsets = arrayOf(0 to 0, -gap to -gap, gap to -gap, -gap to gap, gap to gap)
         val points = offsets.map { (dx, dy) -> sample(image, cx + dx, cy + dy) }
-        val centerOnly = (prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) == SAMPLE_CENTER)
+        val centerOnly = prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) == SAMPLE_CENTER
         val used = if (centerOnly) listOf(points.first()) else points
         val blueVotes = used.count { it.isBlue }
         val avgR = used.sumOf { it.r } / used.size
@@ -441,6 +677,153 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
             prefs.edit().putString("calibration.${currentSettings().profileId}", text).apply()
             notifyStatus("Étalonnage terminé · $text")
         }
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        val vector = motionVector(event) ?: return
+        val now = SystemClock.elapsedRealtime()
+        val x = vector[0]
+        val y = vector[1]
+        val z = vector[2]
+        val magnitude = sqrt(x * x + y * y + z * z)
+        if (gestureCalibrationRemaining > 0) {
+            handleGestureCalibration(now, x, y, z, magnitude)
+        } else if (prefs.getBoolean(PREF_GESTURE_ENABLED, false) && hasGestureCalibration()) {
+            handleGestureDetection(now, x, y, z)
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    private fun motionVector(event: SensorEvent): FloatArray? {
+        if (event.values.size < 3) return null
+        if (event.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION) {
+            return floatArrayOf(event.values[0], event.values[1], event.values[2])
+        }
+        if (!gravityReady) {
+            gravity[0] = event.values[0]
+            gravity[1] = event.values[1]
+            gravity[2] = event.values[2]
+            gravityReady = true
+            return null
+        }
+        val alpha = 0.82f
+        for (i in 0..2) gravity[i] = alpha * gravity[i] + (1f - alpha) * event.values[i]
+        return floatArrayOf(event.values[0] - gravity[0], event.values[1] - gravity[1], event.values[2] - gravity[2])
+    }
+
+    private fun handleGestureCalibration(now: Long, x: Float, y: Float, z: Float, magnitude: Float) {
+        if (now - lastCalibrationPairMs < 550L || magnitude < CALIBRATION_MIN_ACCEL) return
+        val current = MotionImpulse(x, y, z, magnitude, now)
+        val first = calibrationImpulse
+        if (first == null || now - first.timeMs > GESTURE_PAIR_WINDOW_MS) {
+            calibrationImpulse = current
+            return
+        }
+        val cosine = dot(first.x, first.y, first.z, x, y, z) / (first.magnitude * magnitude).coerceAtLeast(0.001f)
+        if (cosine <= -0.18f) {
+            val axis = normalize(first.x - x, first.y - y, first.z - z)
+            if (axis != null) {
+                val aligned = alignAxis(axis)
+                gestureCalibrationAxes.add(aligned)
+                gestureCalibrationPeaks.add((first.magnitude + magnitude) * 0.5f)
+                gestureCalibrationRemaining--
+                lastCalibrationPairMs = now
+                calibrationImpulse = null
+                val done = GESTURE_CALIBRATION_COUNT - gestureCalibrationRemaining
+                val message = "Geste $done/$GESTURE_CALIBRATION_COUNT enregistré."
+                notifyStatus(message)
+                speak(done.toString())
+                if (gestureCalibrationRemaining == 0) finishGestureCalibration()
+                return
+            }
+        }
+        if (cosine > 0.55f && magnitude > first.magnitude) calibrationImpulse = current
+    }
+
+    private fun alignAxis(axis: FloatArray): FloatArray {
+        val reference = gestureCalibrationAxes.firstOrNull() ?: return axis
+        return if (dot(reference[0], reference[1], reference[2], axis[0], axis[1], axis[2]) < 0f) {
+            floatArrayOf(-axis[0], -axis[1], -axis[2])
+        } else axis
+    }
+
+    private fun finishGestureCalibration() {
+        if (gestureCalibrationAxes.isEmpty()) return
+        val ax = gestureCalibrationAxes.sumOf { it[0].toDouble() }.toFloat()
+        val ay = gestureCalibrationAxes.sumOf { it[1].toDouble() }.toFloat()
+        val az = gestureCalibrationAxes.sumOf { it[2].toDouble() }.toFloat()
+        val axis = normalize(ax, ay, az) ?: return
+        val averagePeak = gestureCalibrationPeaks.average().toFloat()
+        val threshold = max(2.0f, averagePeak * 0.45f)
+        prefs.edit()
+            .putFloat(PREF_GESTURE_AXIS_X, axis[0])
+            .putFloat(PREF_GESTURE_AXIS_Y, axis[1])
+            .putFloat(PREF_GESTURE_AXIS_Z, axis[2])
+            .putFloat(PREF_GESTURE_THRESHOLD, threshold)
+            .putBoolean(PREF_GESTURE_ENABLED, true)
+            .apply()
+        projectionImpulse = null
+        updateSensorRegistration()
+        speak("calibration terminée")
+        notifyStatus("Calibration mouvement terminée · tir par à-coup activé. Seuil ${String.format(Locale.US, "%.1f", threshold)} m/s².")
+    }
+
+    private fun handleGestureDetection(now: Long, x: Float, y: Float, z: Float) {
+        if (now - lastGestureShotMs < GESTURE_COOLDOWN_MS) return
+        val ax = prefs.getFloat(PREF_GESTURE_AXIS_X, 0f)
+        val ay = prefs.getFloat(PREF_GESTURE_AXIS_Y, 0f)
+        val az = prefs.getFloat(PREF_GESTURE_AXIS_Z, 0f)
+        val base = prefs.getFloat(PREF_GESTURE_THRESHOLD, 4f)
+        val sensitivity = prefs.getInt(PREF_GESTURE_SENSITIVITY, 60).coerceIn(0, 100)
+        val multiplier = 1.35f - sensitivity * 0.0075f
+        val threshold = max(1.8f, base * multiplier)
+        val projection = x * ax + y * ay + z * az
+        if (abs(projection) < threshold) return
+
+        val first = projectionImpulse
+        if (first == null || now - first.timeMs > GESTURE_PAIR_WINDOW_MS) {
+            projectionImpulse = ProjectionImpulse(projection, now)
+            return
+        }
+        if (first.value * projection < 0f && abs(projection) >= threshold * 0.58f) {
+            projectionImpulse = null
+            lastGestureShotMs = now
+            mainHandler.post { fire() }
+        } else if ((first.value >= 0f) == (projection >= 0f) && abs(projection) > abs(first.value)) {
+            projectionImpulse = ProjectionImpulse(projection, now)
+        }
+    }
+
+    private fun chooseMotionSensor(): Sensor? {
+        return sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION, true)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER, true)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    }
+
+    private fun updateSensorRegistration(force: Boolean = false) {
+        val shouldRun = force || gestureCalibrationRemaining > 0 || prefs.getBoolean(PREF_GESTURE_ENABLED, false)
+        if (shouldRun && !sensorRegistered) {
+            motionSensor?.let {
+                sensorRegistered = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                if (sensorRegistered && !it.isWakeUpSensor) acquireGestureWakeLock()
+            }
+        } else if (!shouldRun && sensorRegistered) {
+            sensorManager.unregisterListener(this)
+            sensorRegistered = false
+            releaseGestureWakeLock()
+        }
+    }
+
+    private fun hasGestureCalibration(): Boolean = prefs.contains(PREF_GESTURE_THRESHOLD)
+
+    private fun dot(ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float): Float = ax * bx + ay * by + az * bz
+
+    private fun normalize(x: Float, y: Float, z: Float): FloatArray? {
+        val n = sqrt(x * x + y * y + z * z)
+        if (n < 0.001f) return null
+        return floatArrayOf(x / n, y / n, z / n)
     }
 
     private fun ensureValidCameraPreference() {
@@ -497,6 +880,13 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
     private fun profileId(cameraId: String, width: Int, height: Int, mode: String): String =
         "cam${cameraId.replace(Regex("[^A-Za-z0-9_-]"), "_")}-${width}x${height}-$mode"
 
+    private fun magazineSize(): Int = prefs.getInt(PREF_MAGAZINE_SIZE, 12).coerceIn(1, 99)
+
+    private fun notifyAmmo() {
+        val capacity = magazineSize()
+        ContextCompat.getMainExecutor(this).execute { listener?.onAmmo(ammo, capacity, reloading) }
+    }
+
     private fun notifyStatus(message: String) {
         ContextCompat.getMainExecutor(this).execute { listener?.onStatus(message) }
     }
@@ -514,7 +904,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setContentTitle(if (rec) "WebCS · REC" else "WebCS · caméra active")
-            .setContentText(if (rec) "Enregistrement continue écran éteint" else "Service caméra prêt pour écran éteint")
+            .setContentText(if (rec) "Enregistrement continue écran éteint" else "Caméra et déclencheur de jeu actifs")
             .setContentIntent(openIntent)
             .setOngoing(true)
             .addAction(0, if (rec) "STOP REC" else "ARRÊTER", stopAction)
@@ -522,18 +912,32 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0)
     }
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
+    private fun acquireRecordingWakeLock() {
+        if (recordingWakeLock?.isHeld == true) return
         val pm = getSystemService(PowerManager::class.java)
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WebCS:recording").apply {
+        recordingWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WebCS:recording").apply {
             setReferenceCounted(false)
             acquire()
         }
     }
 
-    private fun releaseWakeLock() {
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
+    private fun releaseRecordingWakeLock() {
+        recordingWakeLock?.let { if (it.isHeld) it.release() }
+        recordingWakeLock = null
+    }
+
+    private fun acquireGestureWakeLock() {
+        if (gestureWakeLock?.isHeld == true) return
+        val pm = getSystemService(PowerManager::class.java)
+        gestureWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WebCS:gesture").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseGestureWakeLock() {
+        gestureWakeLock?.let { if (it.isHeld) it.release() }
+        gestureWakeLock = null
     }
 
     private fun speak(message: String) {
@@ -549,11 +953,16 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
 
     override fun onDestroy() {
         listener = null
-        stopRecording()
-        releaseWakeLock()
+        reloading = false
+        stopRecordingNow()
+        if (sensorRegistered) sensorManager.unregisterListener(this)
+        sensorRegistered = false
+        releaseRecordingWakeLock()
+        releaseGestureWakeLock()
         cameraProvider?.unbindAll()
         tts?.stop()
         tts?.shutdown()
+        sfx.release()
         cameraExecutor.shutdown()
         super.onDestroy()
     }
@@ -569,9 +978,25 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener 
         private const val PREF_HEIGHT = "camera.height"
         private const val PREF_SAMPLE_MODE = "camera.sampleMode"
         private const val PREF_VIDEO_QUALITY = "camera.videoQuality"
+        private const val PREF_SFX_ENABLED = "game.sfxEnabled"
+        private const val PREF_SFX_VOLUME = "game.sfxVolume"
+        private const val PREF_MAGAZINE_SIZE = "game.magazineSize"
+        private const val PREF_GESTURE_ENABLED = "game.gestureEnabled"
+        private const val PREF_GESTURE_SENSITIVITY = "game.gestureSensitivity"
+        private const val PREF_GESTURE_AXIS_X = "gesture.axisX"
+        private const val PREF_GESTURE_AXIS_Y = "gesture.axisY"
+        private const val PREF_GESTURE_AXIS_Z = "gesture.axisZ"
+        private const val PREF_GESTURE_THRESHOLD = "gesture.threshold"
         private const val CHANNEL_ID = "webcs_camera"
         private const val NOTIFICATION_ID = 4301
         private const val ACTION_STOP_RECORDING = "online.tek4all.webcs.STOP_RECORDING"
         private const val ACTION_STOP_SERVICE = "online.tek4all.webcs.STOP_SERVICE"
+        private const val GESTURE_CALIBRATION_COUNT = 5
+        private const val GESTURE_PAIR_WINDOW_MS = 330L
+        private const val GESTURE_COOLDOWN_MS = 520L
+        private const val CALIBRATION_MIN_ACCEL = 3.0f
+        private const val RELOAD_DURATION_MS = 1250L
+        private const val MIN_RECORDING_MS = 850L
+        private const val MIN_VALID_RECORDING_NS = 350_000_000L
     }
 }
