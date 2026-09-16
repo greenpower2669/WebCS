@@ -120,12 +120,14 @@ replacements = [
 ]
 
 for old, new in replacements:
+    if new in text:
+        continue
     if old not in text:
-        raise SystemExit(f"Hotfix pattern not found:\n{old[:180]}")
+        raise SystemExit(f"Hotfix pattern not found and replacement absent:\n{old[:180]}")
     text = text.replace(old, new, 1)
 
 if text != original:
     path.write_text(text, encoding="utf-8")
     print("CameraForegroundService.kt patched")
 else:
-    print("No changes needed")
+    print("CameraX hotfix already present")
