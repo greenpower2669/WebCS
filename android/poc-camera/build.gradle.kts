@@ -11,8 +11,8 @@ android {
         applicationId = "online.tek4all.webcs.poc"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "0.7.0"
+        versionCode = 9
+        versionName = "0.8.0"
     }
 
     compileOptions {
