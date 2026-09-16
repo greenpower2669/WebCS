@@ -183,12 +183,14 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     fun attachPreview(surfaceProvider: Preview.SurfaceProvider) {
         previewProvider = surfaceProvider
-        val existing = previewUseCase
-        if (existing != null) {
-            existing.setSurfaceProvider(surfaceProvider)
-            return
+        // Recrée une session unique Preview + Analysis + VideoCapture.
+        // Sur certains Samsung, ajouter Preview dans une seconde liaison CameraX
+        // laisse l'aperçu fonctionner mais peut affamer ImageAnalysis.
+        if (cameraProvider != null && recording == null) {
+            rebindCamera()
+        } else {
+            previewUseCase?.setSurfaceProvider(surfaceProvider)
         }
-        bindPreviewOnly()
     }
 
     fun isRecording(): Boolean = recording != null
@@ -260,7 +262,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     fun getVideoQualityOptions(cameraId: String): List<QualityOption> {
         val info = findCameraInfo(cameraId) ?: return listOf(QualityOption("AUTO", "Auto"))
         val supported = QualitySelector.getSupportedQualities(info)
-        val result = mutableListOf(QualityOption("AUTO", "Auto (meilleure disponible)"))
+        val result = mutableListOf(QualityOption("AUTO", "Auto (compatible analyse)"))
         supported.forEach { q -> qualityKey(q)?.let { key -> result.add(QualityOption(key, key)) } }
         return result.distinctBy { it.key }
     }
@@ -427,8 +429,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             requestStopRecording()
             return
         }
-        if (latestResult == null || effectiveWidth <= 0) {
-            listener?.onStatus("Attends une image caméra valide avant de lancer REC.")
+        // L'enregistrement vidéo ne doit pas dépendre d'ImageAnalysis.
+        // Le Preview peut être valide même si l'analyse est momentanément en reprise.
+        if (cameraProvider == null) {
+            listener?.onStatus("Caméra pas encore prête pour REC.")
             return
         }
 
@@ -579,10 +583,13 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
                     if (effectiveWidth != image.width || effectiveHeight != image.height) {
                         effectiveWidth = image.width
                         effectiveHeight = image.height
-                        notifyStatus("Résolution d'analyse effective : ${image.width}×${image.height} · caméra $selectedId")
+                        notifyStatus("Analyse prête : ${image.width}×${image.height} · caméra $selectedId")
                     }
                     latestResult = analyse(image)
                     latestResult?.let { consumeCalibration(it) }
+                } catch (e: Exception) {
+                    latestResult = null
+                    notifyStatus("Erreur analyse caméra : ${e.javaClass.simpleName} · ${e.message ?: "sans détail"}")
                 } finally {
                     image.close()
                 }
@@ -592,8 +599,20 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             val recorder = Recorder.Builder().setQualitySelector(QualitySelector.from(quality)).build()
             videoCapture = VideoCapture.withOutput(recorder)
 
-            provider.bindToLifecycle(this, selector, analysis, videoCapture)
-            bindPreviewOnly()
+            // Une seule liaison CameraX pour éviter le cas où Preview fonctionne
+            // alors qu'ImageAnalysis ne reçoit aucune trame.
+            val preview = previewProvider?.let { surface ->
+                Preview.Builder()
+                    .setTargetResolution(requested)
+                    .build()
+                    .also { it.setSurfaceProvider(surface) }
+            }
+            previewUseCase = preview
+            if (preview != null) {
+                provider.bindToLifecycle(this, selector, preview, analysis, videoCapture)
+            } else {
+                provider.bindToLifecycle(this, selector, analysis, videoCapture)
+            }
             listener?.onReady(score, isRecording())
             notifyAmmo()
         } catch (e: Exception) {
@@ -866,7 +885,14 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             "SD" -> Quality.SD
             else -> null
         }
-        return if (desired != null && supported.contains(desired)) desired else supported.first()
+        if (desired != null && supported.contains(desired)) return desired
+        // AUTO privilégie la stabilité de Preview + ImageAnalysis + VideoCapture.
+        // L'utilisateur peut toujours forcer FHD/UHD dans les réglages.
+        return when {
+            supported.contains(Quality.HD) -> Quality.HD
+            supported.contains(Quality.SD) -> Quality.SD
+            else -> supported.last()
+        }
     }
 
     private fun qualityKey(q: Quality): String? = when (q) {
