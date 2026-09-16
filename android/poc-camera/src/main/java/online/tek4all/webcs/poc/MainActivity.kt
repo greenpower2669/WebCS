@@ -344,6 +344,19 @@ class MainActivity : ComponentActivity() {
         }
         content.addView(gestureCalibrateButton)
 
+        val reloadGestureCheck = CheckBox(this).apply {
+            text = "Recharger avec un geste calibré"
+            isChecked = snapshot.reloadGestureEnabled
+        }
+        content.addView(reloadGestureCheck)
+        val reloadGestureProfileText = label(service.reloadGestureCalibrationSummary())
+        content.addView(reloadGestureProfileText)
+        val reloadGestureCalibrateButton = Button(this).apply {
+            text = "CALIBRER MON GESTE DE RECHARGE · 5 FOIS"
+            contentDescription = "Calibrer le rechargement par mouvement"
+        }
+        content.addView(reloadGestureCalibrateButton)
+
         val effectiveText = label("Résolution effective actuelle : ${if (snapshot.effectiveWidth > 0) "${snapshot.effectiveWidth}×${snapshot.effectiveHeight}" else "en attente"}")
         content.addView(effectiveText)
 
@@ -420,6 +433,7 @@ class MainActivity : ComponentActivity() {
                         volumeSeek.progress,
                         gestureCheck.isChecked,
                         sensitivitySeek.progress,
+                        reloadGestureCheck.isChecked,
                         magazineSize
                     )) {
                     dialog.dismiss()
@@ -428,6 +442,11 @@ class MainActivity : ComponentActivity() {
 
             gestureCalibrateButton.setOnClickListener {
                 service.startGestureCalibration()
+                dialog.dismiss()
+            }
+
+            reloadGestureCalibrateButton.setOnClickListener {
+                service.startReloadGestureCalibration()
                 dialog.dismiss()
             }
 
