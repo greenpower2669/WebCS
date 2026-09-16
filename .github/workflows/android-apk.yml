@@ -8,7 +8,7 @@ on:
       - 'settings.gradle.kts'
       - 'gradle.properties'
       - 'tools/hotfix_camera_analysis.py'
-      - 'tools/add_context_reload_data.py'
+      - 'tools/add_hot_stream_training.py'
       - '.github/workflows/android-apk.yml'
   workflow_dispatch:
 
@@ -25,24 +25,8 @@ jobs:
       - name: Apply CameraX analysis hotfix
         run: python3 tools/hotfix_camera_analysis.py
 
-      - name: Prepare v0.8 generator for v0.7 source
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('tools/add_context_reload_data.py')
-          t = p.read_text(encoding='utf-8')
-          old = "'''    companion object {\n        const val SAMPLE_CENTER = \"center\"\n''',"
-          new = "'''    companion object {\n        private const val WEBSC_V070 = true\n        const val SAMPLE_CENTER = \"center\"\n''',"
-          t = t.replace(old, new)
-          old = "'''    companion object {\n        private const val WEBSC_V080 = \"context-reload-data-v1\""
-          new = "'''    companion object {\n        private const val WEBSC_V070 = true\n        private const val WEBSC_V080 = \"context-reload-data-v1\""
-          t = t.replace(old, new)
-          p.write_text(t, encoding='utf-8')
-          PY
-
-      - name: Add contextual reload and arbitration data
-        run: python3 tools/add_context_reload_data.py
+      - name: Add hot stream and training data
+        run: python3 tools/add_hot_stream_training.py
 
       - name: Commit generated source changes if needed
         shell: bash
@@ -51,7 +35,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/MainActivity.kt
-            git commit -m "Add contextual reload state and arbitration CSV"
+            git commit -m "Add hot camera buffer and persistent training data"
             git push
           fi
 
@@ -72,6 +56,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: WebCS-v0.8.0-debug-apk
+          name: WebCS-v0.9.0-debug-apk
           path: android/poc-camera/build/outputs/apk/debug/poc-camera-debug.apk
           if-no-files-found: error
