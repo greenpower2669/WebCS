@@ -1,6 +1,7 @@
 package online.tek4all.webcs.poc
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -15,9 +16,13 @@ import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -45,11 +50,12 @@ class MainActivity : ComponentActivity() {
         override fun onReady(score: Int, recording: Boolean) {
             scoreText.text = "Score $score"
             recText.visibility = if (recording) View.VISIBLE else View.GONE
-            statusText.text = "Caméra de fond prête. Volume - : tir · Volume + : REC/STOP · écran éteint OK."
+            statusText.text = cameraService?.configurationSummary()
+                ?: "Caméra de fond prête. Volume - : tir · Volume + : REC/STOP."
         }
 
-        override fun onShot(hit: Boolean, votes: Int, score: Int, details: String) {
-            decisionText.text = if (hit) "TOUCHÉ  $votes/5" else "RATÉ  $votes/5"
+        override fun onShot(hit: Boolean, votes: Int, total: Int, score: Int, details: String) {
+            decisionText.text = if (hit) "TOUCHÉ  $votes/$total" else "RATÉ  $votes/$total"
             decisionText.setTextColor(if (hit) Color.rgb(80, 220, 120) else Color.rgb(255, 120, 100))
             scoreText.text = "Score $score"
             statusText.text = details
@@ -133,6 +139,25 @@ class MainActivity : ComponentActivity() {
         root.addView(previewView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         root.addView(CrosshairView(this), FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
+        val settingsButton = Button(this).apply {
+            text = "⚙"
+            textSize = 24f
+            contentDescription = "Réglages"
+            setOnClickListener { showSettings() }
+        }
+        val settingsParams = FrameLayout.LayoutParams(dp(64), dp(56), Gravity.TOP or Gravity.START)
+        settingsParams.setMargins(dp(8), dp(8), 0, 0)
+        root.addView(settingsButton, settingsParams)
+        ViewCompat.setOnApplyWindowInsetsListener(settingsButton) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            (view.layoutParams as FrameLayout.LayoutParams).apply {
+                topMargin = bars.top + dp(8)
+                leftMargin = bars.left + dp(8)
+                view.layoutParams = this
+            }
+            insets
+        }
+
         recText = textView("● REC", 18f).apply {
             setTextColor(Color.RED)
             visibility = View.GONE
@@ -191,6 +216,150 @@ class MainActivity : ComponentActivity() {
 
         setContentView(root)
         ViewCompat.requestApplyInsets(root)
+    }
+
+    private fun showSettings() {
+        val service = cameraService
+        if (service == null) {
+            statusText.text = "Service caméra pas encore prêt."
+            return
+        }
+        if (service.isRecording()) {
+            statusText.text = "Arrête le REC avant d'ouvrir les réglages caméra."
+            return
+        }
+
+        val snapshot = service.currentSettings()
+        val cameras = service.getCameraOptions()
+        if (cameras.isEmpty()) {
+            statusText.text = "Liste des caméras pas encore disponible."
+            return
+        }
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+        }
+        val scroll = ScrollView(this).apply { addView(content) }
+
+        fun label(text: String): TextView = textView(text, 16f).apply {
+            setTextColor(Color.BLACK)
+            setPadding(0, dp(10), 0, dp(4))
+        }
+
+        content.addView(label("Caméra physique / logique"))
+        val cameraSpinner = Spinner(this)
+        cameraSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, cameras.map { it.label }).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        val currentCameraIndex = cameras.indexOfFirst { it.id == snapshot.cameraId }.coerceAtLeast(0)
+        cameraSpinner.setSelection(currentCameraIndex)
+        content.addView(cameraSpinner)
+
+        content.addView(label("Résolution d'analyse"))
+        val resolutionSpinner = Spinner(this)
+        content.addView(resolutionSpinner)
+
+        content.addView(label("Mesure pour la décision"))
+        val sampleLabels = listOf("Centre seul", "Centre + 4 points")
+        val sampleSpinner = Spinner(this)
+        sampleSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, sampleLabels).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        sampleSpinner.setSelection(if (snapshot.sampleMode == CameraForegroundService.SAMPLE_CENTER) 0 else 1)
+        content.addView(sampleSpinner)
+
+        content.addView(label("Qualité vidéo"))
+        val qualitySpinner = Spinner(this)
+        content.addView(qualitySpinner)
+
+        val effectiveText = label("Résolution effective actuelle : ${if (snapshot.effectiveWidth > 0) "${snapshot.effectiveWidth}×${snapshot.effectiveHeight}" else "en attente"}")
+        content.addView(effectiveText)
+
+        val profileText = label(service.calibrationSummary())
+        content.addView(profileText)
+
+        val calibrateButton = Button(this).apply { text = "ÉTALONNER CE PROFIL" }
+        content.addView(calibrateButton)
+
+        val quitButton = Button(this).apply {
+            text = "QUITTER WEB CS"
+            setTextColor(Color.rgb(180, 30, 30))
+        }
+        content.addView(quitButton)
+
+        var resolutionOptions = service.getResolutionOptions(cameras[currentCameraIndex].id)
+        var qualityOptions = service.getVideoQualityOptions(cameras[currentCameraIndex].id)
+
+        fun refreshResolution(cameraId: String) {
+            resolutionOptions = service.getResolutionOptions(cameraId)
+            resolutionSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, resolutionOptions.map { it.label }).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            val wanted = if (cameraId == snapshot.cameraId) {
+                resolutionOptions.indexOfFirst { it.width == snapshot.requestedWidth && it.height == snapshot.requestedHeight }
+            } else {
+                resolutionOptions.indexOfFirst { it.width == 640 && it.height == 480 }
+            }
+            resolutionSpinner.setSelection(if (wanted >= 0) wanted else 0)
+        }
+
+        fun refreshQuality(cameraId: String) {
+            qualityOptions = service.getVideoQualityOptions(cameraId)
+            qualitySpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, qualityOptions.map { it.label }).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            val wanted = if (cameraId == snapshot.cameraId) qualityOptions.indexOfFirst { it.key == snapshot.videoQuality } else 0
+            qualitySpinner.setSelection(if (wanted >= 0) wanted else 0)
+        }
+
+        refreshResolution(cameras[currentCameraIndex].id)
+        refreshQuality(cameras[currentCameraIndex].id)
+
+        cameraSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val cameraId = cameras[position].id
+                refreshResolution(cameraId)
+                refreshQuality(cameraId)
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("WebCS · réglages caméra")
+            .setView(scroll)
+            .setPositiveButton("APPLIQUER", null)
+            .setNegativeButton("FERMER", null)
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val camera = cameras[cameraSpinner.selectedItemPosition]
+                val resolution = resolutionOptions[resolutionSpinner.selectedItemPosition]
+                val sampleMode = if (sampleSpinner.selectedItemPosition == 0) CameraForegroundService.SAMPLE_CENTER else CameraForegroundService.SAMPLE_FIVE
+                val quality = qualityOptions[qualitySpinner.selectedItemPosition]
+                if (service.applySettings(camera.id, resolution.width, resolution.height, sampleMode, quality.key)) {
+                    dialog.dismiss()
+                }
+            }
+
+            calibrateButton.setOnClickListener {
+                service.startCalibration()
+                dialog.dismiss()
+            }
+
+            quitButton.setOnClickListener {
+                dialog.dismiss()
+                shutdownApp()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun shutdownApp() {
+        cameraService?.shutdown()
+        stopService(Intent(this, CameraForegroundService::class.java))
+        finishAndRemoveTask()
     }
 
     private fun textView(value: String, size: Float) = TextView(this).apply {
