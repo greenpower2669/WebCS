@@ -43,7 +43,9 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
+import java.io.File
 import java.text.SimpleDateFormat
+import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
@@ -100,6 +102,13 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     private data class ProjectionImpulse(val value: Float, val timeMs: Long)
 
+    private data class AimFrame(
+        val timestampNs: Long,
+        val patchSize: Int,
+        val patchPixels: IntArray,
+        val decisionPoints: List<PointSample>
+    )
+
     inner class LocalBinder : Binder() { fun getService(): CameraForegroundService = this@CameraForegroundService }
 
     private val binder = LocalBinder()
@@ -108,6 +117,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     private var cameraProvider: ProcessCameraProvider? = null
     private var previewUseCase: Preview? = null
     private var previewProvider: Preview.SurfaceProvider? = null
+    @Volatile private var previewEnabled = true
     private lateinit var videoCapture: VideoCapture<Recorder>
     private var recording: Recording? = null
     private var recordingStopping = false
@@ -170,6 +180,8 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     private var eventSequence = 0L
     private var sessionId = makeSessionId()
     private var sessionStartElapsedNs = SystemClock.elapsedRealtimeNanos()
+    private val aimFrameLock = Any()
+    private val aimFrames = ArrayDeque<AimFrame>(AIM_RING_SIZE)
 
     var listener: Listener? = null
 
@@ -190,6 +202,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         updateSensorRegistration()
         createChannel()
         promoteToForeground(false)
+        ensureSessionFile()
         startCameraCore()
     }
 
@@ -212,15 +225,35 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     fun attachPreview(surfaceProvider: Preview.SurfaceProvider) {
         previewProvider = surfaceProvider
-        // Recrée une session unique Preview + Analysis + VideoCapture.
-        // Sur certains Samsung, ajouter Preview dans une seconde liaison CameraX
-        // laisse l'aperçu fonctionner mais peut affamer ImageAnalysis.
-        if (cameraProvider != null && recording == null) {
+        // Premier attachement seulement : si le service avait démarré sans UI,
+        // on crée une session commune Preview + Analysis + VideoCapture.
+        // Ensuite APERÇU ON/OFF ne rebinde JAMAIS la caméra.
+        if (cameraProvider != null && previewUseCase == null && recording == null) {
             rebindCamera()
-        } else {
+        } else if (previewEnabled) {
             previewUseCase?.setSurfaceProvider(surfaceProvider)
         }
     }
+
+    fun setPreviewEnabled(enabled: Boolean, surfaceProvider: Preview.SurfaceProvider? = previewProvider) {
+        previewEnabled = enabled
+        if (surfaceProvider != null) previewProvider = surfaceProvider
+        val preview = previewUseCase
+        if (preview == null) {
+            // Cas de tout premier attachement uniquement. Pas utilisé par le bouton ON/OFF normal.
+            if (enabled && cameraProvider != null && recording == null && previewProvider != null) rebindCamera()
+            return
+        }
+        // API CameraX officielle : null arrête la production de données pour Preview,
+        // sans unbind et sans arrêter ImageAnalysis / la caméra chaude.
+        preview.setSurfaceProvider(if (enabled) previewProvider else null)
+        listener?.onStatus(
+            if (enabled) "Aperçu ON · caméra et buffer de visée inchangés."
+            else "Aperçu OFF · rendu vidéo coupé, caméra et buffer de visée restent actifs."
+        )
+    }
+
+    fun isPreviewEnabled(): Boolean = previewEnabled
 
     fun isRecording(): Boolean = recording != null
     fun currentScore(): Int = score
@@ -260,7 +293,8 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val mode = if (s.sampleMode == SAMPLE_CENTER) "centre" else "5 points"
         val shotMotion = if (s.gestureEnabled) " · tir geste ON" else ""
         val reloadMotion = if (s.reloadGestureEnabled) " · recharge geste ON" else ""
-        return "Cam ${s.cameraId} · demandé ${s.requestedWidth}×${s.requestedHeight} · effectif $effective · $mode · vidéo ${s.videoQuality}$shotMotion$reloadMotion"
+        val preview = if (previewEnabled) " · aperçu ON" else " · aperçu OFF"
+        return "Cam ${s.cameraId} · demandé ${s.requestedWidth}×${s.requestedHeight} · effectif $effective · $mode · analyse au tir · buffer ${AIM_RING_SIZE} frames · vidéo ${s.videoQuality}$shotMotion$reloadMotion$preview"
     }
 
     fun getCameraOptions(): List<CameraOption> {
@@ -352,7 +386,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     fun startCalibration() {
-        if (latestResult == null) {
+        if (nearestAimFrame(SystemClock.elapsedRealtimeNanos()) == null) {
             listener?.onStatus("Attends une image caméra avant de calibrer la cible.")
             return
         }
@@ -389,7 +423,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     fun sessionDataSummary(): String {
         val count = synchronized(eventLog) { eventLog.size }
-        return "Session $sessionId · $count événements · joueur ${currentPlayerName()}"
+        return "Session $sessionId · $count événements · sauvegarde auto entraînement active · joueur ${currentPlayerName()}"
     }
 
     fun startNewDataSession() {
@@ -397,7 +431,28 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         eventSequence = 0L
         sessionId = makeSessionId()
         sessionStartElapsedNs = SystemClock.elapsedRealtimeNanos()
-        listener?.onStatus("Nouvelle session de données · $sessionId")
+        ensureSessionFile()
+        listener?.onStatus("Nouvelle session de données · $sessionId · sauvegarde auto active")
+    }
+
+    private fun trainingDir(): File = File(filesDir, "webcs-training").apply { mkdirs() }
+
+    private fun currentSessionFile(): File = File(trainingDir(), "WebCS-training-$sessionId.csv")
+
+    private fun ensureSessionFile(): File {
+        val file = currentSessionFile()
+        if (!file.exists()) {
+            file.writeText("\uFEFF$CSV_HEADER\n", Charsets.UTF_8)
+        }
+        return file
+    }
+
+    private fun persistSessionRow(row: String) {
+        try {
+            ensureSessionFile().appendText(row + "\n", Charsets.UTF_8)
+        } catch (e: Exception) {
+            notifyStatus("Attention : sauvegarde data impossible · ${e.message ?: "erreur"}")
+        }
     }
 
     fun exportSessionCsv(): Uri? {
@@ -406,7 +461,8 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             return null
         }
         val rows = synchronized(eventLog) { eventLog.toList() }
-        val fileName = "WebCS-arbitrage-$sessionId.csv"
+        val source = ensureSessionFile()
+        val fileName = "WebCS-training-arbitrage-$sessionId.csv"
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
             put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
@@ -414,13 +470,11 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         }
         val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
         return try {
-            contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8).use { writer ->
-                if (writer == null) throw IllegalStateException("sortie CSV indisponible")
-                writer.write("\uFEFF")
-                writer.appendLine(CSV_HEADER)
-                rows.forEach { writer.appendLine(it) }
+            contentResolver.openOutputStream(uri).use { output ->
+                if (output == null) throw IllegalStateException("sortie CSV indisponible")
+                source.inputStream().use { input -> input.copyTo(output) }
             }
-            listener?.onStatus("CSV prêt · $fileName · ${rows.size} événements.")
+            listener?.onStatus("Data entraînement/arbitrage prête · $fileName · ${rows.size} événements.")
             uri
         } catch (e: Exception) {
             try { contentResolver.delete(uri, null, null) } catch (_: Exception) { }
@@ -439,15 +493,48 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         } else text
     }
 
-    private fun logGameEvent(type: String, result: ScanResult? = latestResult, hit: Boolean? = null) {
+    private fun recognitionMode(): String {
+        val id = currentSettings().profileId
+        return if (prefs.contains("target.$id.r")) "calibrated_rgb_distance" else "legacy_blue_hsv"
+    }
+
+    private fun targetDistance(result: ScanResult?): Float? {
+        result ?: return null
+        val id = currentSettings().profileId
+        if (!prefs.contains("target.$id.r")) return null
+        val dr = result.r - prefs.getInt("target.$id.r", 0)
+        val dg = result.g - prefs.getInt("target.$id.g", 0)
+        val db = result.b - prefs.getInt("target.$id.b", 0)
+        return sqrt((dr * dr + dg * dg + db * db).toFloat())
+    }
+
+    private fun patchHex(frame: AimFrame?): String {
+        frame ?: return ""
+        return frame.patchPixels.joinToString(";") { String.format(Locale.US, "%06X", it and 0xFFFFFF) }
+    }
+
+    private fun logGameEvent(
+        type: String,
+        result: ScanResult? = latestResult,
+        hit: Boolean? = null,
+        frame: AimFrame? = null,
+        triggerNs: Long? = null,
+        trainingLabel: String = ""
+    ) {
         val nowNs = SystemClock.elapsedRealtimeNanos()
+        val chosenFrame = frame ?: nearestAimFrame(triggerNs ?: nowNs)
+        val trigger = triggerNs ?: nowNs
+        val frameNs = chosenFrame?.timestampNs
+        val deltaUs = frameNs?.let { (it - trigger) / 1000L }
         val seq = ++eventSequence
-        val points = latestRawPoints.take(5)
+        val points = chosenFrame?.decisionPoints?.take(5).orEmpty()
         val values = mutableListOf<String>()
         values += listOf(
-            "1", sessionId, seq.toString(), type,
+            "2", sessionId, seq.toString(), type,
             System.currentTimeMillis().toString(), nowNs.toString(), (nowNs - sessionStartElapsedNs).toString(),
-            currentPlayerName(), hit?.toString() ?: "",
+            trigger.toString(), frameNs?.toString() ?: "", deltaUs?.toString() ?: "",
+            currentPlayerName(), hit?.toString() ?: "", trainingLabel,
+            recognitionMode(), targetDistance(result)?.toString() ?: "",
             result?.r?.toString() ?: "", result?.g?.toString() ?: "", result?.b?.toString() ?: "",
             result?.h?.toString() ?: "", result?.s?.toString() ?: "", result?.v?.toString() ?: ""
         )
@@ -456,12 +543,15 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             values += listOf(p?.r?.toString() ?: "", p?.g?.toString() ?: "", p?.b?.toString() ?: "")
         }
         values += listOf(
+            chosenFrame?.patchSize?.toString() ?: "", patchHex(chosenFrame),
             lastCameraElevationDeg?.toString() ?: "",
             selectedCameraId(), effectiveWidth.toString(), effectiveHeight.toString(),
+            prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) ?: SAMPLE_FIVE,
             ammo.toString(), magazineSize().toString(), score.toString(), currentSettings().profileId
         )
         val row = values.joinToString(",") { csv(it) }
         synchronized(eventLog) { eventLog.add(row) }
+        persistSessionRow(row)
     }
 
     fun startGestureCalibration() {
@@ -519,22 +609,31 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     fun fire() {
+        fireAt(SystemClock.elapsedRealtimeNanos())
+    }
+
+    private fun fireAt(triggerNs: Long) {
         if (reloading) {
             listener?.onStatus("Rechargement en cours…")
             return
         }
-        val result = latestResult
-        if (result == null) {
-            listener?.onStatus("Pas encore d'image exploitable.")
+        val frame = nearestAimFrame(triggerNs)
+        if (frame == null) {
+            listener?.onStatus("Pas encore de frame de visée exploitable.")
             return
         }
+        val result = classifyFrame(frame)
+        latestResult = result
+        latestRawPoints = frame.decisionPoints
+        val deltaUs = (frame.timestampNs - triggerNs) / 1000L
         if (targetCalibrationRemaining > 0) {
             sfx.playShot()
-            recordTargetCalibrationShot(result)
+            recordTargetCalibrationShot(result, frame, triggerNs)
             return
         }
         if (ammo <= 0) {
             sfx.playEmpty()
+            logGameEvent("empty", result, null, frame, triggerNs)
             listener?.onStatus("Clic · chargeur vide. Recharge.")
             notifyAmmo()
             return
@@ -545,9 +644,9 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             score++
             prefs.edit().putInt("score", score).apply()
         }
-        logGameEvent("shot", result, result.hit)
+        logGameEvent("shot", result, result.hit, frame, triggerNs)
         val mode = if (result.total == 1) "centre" else "5 points"
-        val details = "RGB ${result.r}/${result.g}/${result.b}   HSV ${result.h.roundToInt()}°/${(result.s * 100).roundToInt()}%/${(result.v * 100).roundToInt()}% · $mode · ${effectiveWidth}×${effectiveHeight} · munitions $ammo/${magazineSize()}"
+        val details = "RGB ${result.r}/${result.g}/${result.b}   HSV ${result.h.roundToInt()}°/${(result.s * 100).roundToInt()}%/${(result.v * 100).roundToInt()}% · $mode · frame Δ ${deltaUs} µs · ${effectiveWidth}×${effectiveHeight} · munitions $ammo/${magazineSize()}"
         listener?.onShot(result.hit, result.blueVotes, result.total, score, details)
         notifyAmmo()
         if (ammo == 0) {
@@ -742,13 +841,16 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
                     if (effectiveWidth != image.width || effectiveHeight != image.height) {
                         effectiveWidth = image.width
                         effectiveHeight = image.height
-                        notifyStatus("Analyse prête : ${image.width}×${image.height} · caméra $selectedId")
+                        notifyStatus("Flux de visée prêt : ${image.width}×${image.height} · caméra $selectedId · reconnaissance seulement au tir")
                     }
-                    latestResult = analyse(image)
-                    latestResult?.let { consumeCalibration(it) }
+                    val frame = captureAimFrame(image)
+                    synchronized(aimFrameLock) {
+                        while (aimFrames.size >= AIM_RING_SIZE) aimFrames.removeFirst()
+                        aimFrames.addLast(frame)
+                    }
+                    maybePublishAimPatch(frame)
                 } catch (e: Exception) {
-                    latestResult = null
-                    notifyStatus("Erreur analyse caméra : ${e.javaClass.simpleName} · ${e.message ?: "sans détail"}")
+                    notifyStatus("Erreur buffer caméra : ${e.javaClass.simpleName} · ${e.message ?: "sans détail"}")
                 } finally {
                     image.close()
                 }
@@ -764,7 +866,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
                 Preview.Builder()
                     .setTargetResolution(requested)
                     .build()
-                    .also { it.setSurfaceProvider(surface) }
+                    .also { it.setSurfaceProvider(if (previewEnabled) surface else null) }
             }
             previewUseCase = preview
             if (preview != null) {
@@ -796,13 +898,30 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         }
     }
 
-    private fun analyse(image: ImageProxy): ScanResult {
+    private fun captureAimFrame(image: ImageProxy): AimFrame {
         val cx = image.width / 2
         val cy = image.height / 2
+        val half = AIM_PATCH_SIZE / 2
+        val patch = IntArray(AIM_PATCH_SIZE * AIM_PATCH_SIZE)
+        var index = 0
+        for (dy in -half..half) {
+            for (dx in -half..half) {
+                val p = sample(image, cx + dx, cy + dy)
+                patch[index++] = Color.rgb(p.r, p.g, p.b)
+            }
+        }
         val gap = max(2, (min(image.width, image.height) * 0.008f).roundToInt())
         val offsets = arrayOf(0 to 0, -gap to -gap, gap to -gap, -gap to gap, gap to gap)
-        val points = offsets.map { (dx, dy) -> sample(image, cx + dx, cy + dy) }
-        latestRawPoints = points
+        val decision = offsets.map { (dx, dy) -> sample(image, cx + dx, cy + dy) }
+        return AimFrame(image.imageInfo.timestamp, AIM_PATCH_SIZE, patch, decision)
+    }
+
+    private fun nearestAimFrame(triggerNs: Long): AimFrame? = synchronized(aimFrameLock) {
+        aimFrames.minByOrNull { frame -> kotlin.math.abs(frame.timestampNs - triggerNs) }
+    }
+
+    private fun classifyFrame(frame: AimFrame): ScanResult {
+        val points = frame.decisionPoints
         val centerOnly = prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) == SAMPLE_CENTER
         val used = if (centerOnly) listOf(points.first()) else points
         val targetVotes = used.count { matchesTarget(it.r, it.g, it.b) }
@@ -812,7 +931,6 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val hsv = FloatArray(3)
         Color.RGBToHSV(avgR, avgG, avgB, hsv)
         val hit = if (centerOnly) targetVotes == 1 else targetVotes >= 3
-        maybePublishAimPatch(image, cx, cy)
         return ScanResult(hit, targetVotes, used.size, avgR, avgG, avgB, hsv[0], hsv[1], hsv[2])
     }
 
@@ -856,10 +974,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         return sqrt(dr * dr + dg * dg + db * db) <= tolerance
     }
 
-    private fun recordTargetCalibrationShot(result: ScanResult) {
+    private fun recordTargetCalibrationShot(result: ScanResult, frame: AimFrame, triggerNs: Long) {
         if (targetCalibrationRemaining <= 0) return
         targetCalibrationCount++
-        logGameEvent("target_calibration", result, null)
+        logGameEvent("target_calibration", result, null, frame, triggerNs, "enemy_reference")
         targetSumR += result.r
         targetSumG += result.g
         targetSumB += result.b
@@ -892,21 +1010,14 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         listener?.onStatus("Couleur ennemi calibrée · RGB ${mr.roundToInt()}/${mg.roundToInt()}/${mb.roundToInt()} · tolérance ${tolerance.roundToInt()}.")
     }
 
-    private fun maybePublishAimPatch(image: ImageProxy, cx: Int, cy: Int) {
+    private fun maybePublishAimPatch(frame: AimFrame) {
+        if (targetCalibrationRemaining <= 0) return
         patchFrameCounter++
         if (patchFrameCounter % 4 != 0) return
-        val half = AIM_PATCH_SIZE / 2
-        val pixels = IntArray(AIM_PATCH_SIZE * AIM_PATCH_SIZE)
-        var index = 0
-        for (dy in -half..half) {
-            for (dx in -half..half) {
-                val p = sample(image, cx + dx, cy + dy)
-                pixels[index++] = Color.rgb(p.r, p.g, p.b)
-            }
-        }
+        val pixels = frame.patchPixels.copyOf()
         val remaining = targetCalibrationRemaining
         ContextCompat.getMainExecutor(this).execute {
-            listener?.onAimPatch(AIM_PATCH_SIZE, pixels, remaining)
+            listener?.onAimPatch(frame.patchSize, pixels, remaining)
         }
     }
 
@@ -953,7 +1064,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
                 // L'orientation donne le sens du geste : dans cette fenêtre, aucun tir accidentel.
                 projectionImpulse = null
             } else if (prefs.getBoolean(PREF_GESTURE_ENABLED, false) && hasGestureCalibration()) {
-                handleGestureDetection(now, x, y, z)
+                handleGestureDetection(now, event.timestamp, x, y, z)
             }
         }
     }
@@ -1092,7 +1203,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         }
     }
 
-    private fun handleGestureDetection(now: Long, x: Float, y: Float, z: Float) {
+    private fun handleGestureDetection(now: Long, triggerNs: Long, x: Float, y: Float, z: Float) {
         if (now - lastGestureShotMs < GESTURE_COOLDOWN_MS || now - lastGestureActionMs < GESTURE_ACTION_GUARD_MS) return
         val ax = prefs.getFloat(PREF_GESTURE_AXIS_X, 0f)
         val ay = prefs.getFloat(PREF_GESTURE_AXIS_Y, 0f)
@@ -1113,7 +1224,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             projectionImpulse = null
             lastGestureShotMs = now
             lastGestureActionMs = now
-            mainHandler.post { fire() }
+            mainHandler.post { fireAt(triggerNs) }
         } else if ((first.value >= 0f) == (projection >= 0f) && abs(projection) > abs(first.value)) {
             projectionImpulse = ProjectionImpulse(projection, now)
         }
@@ -1349,7 +1460,8 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     companion object {
         private const val WEBSC_V070 = true
         private const val WEBSC_V080 = "context-reload-data-v1"
-        private const val CSV_HEADER = "schema_version,session_id,seq,event,wall_time_ms,elapsed_realtime_ns,session_elapsed_ns,player,hit,r,g,b,h,s,v,p0_r,p0_g,p0_b,p1_r,p1_g,p1_b,p2_r,p2_g,p2_b,p3_r,p3_g,p3_b,p4_r,p4_g,p4_b,elevation_deg,camera_id,width,height,ammo,capacity,score,target_profile"
+        private const val WEBSC_V090 = "hot-stream-shot-classification-training-v1"
+        private const val CSV_HEADER = "schema_version,session_id,seq,event,wall_time_ms,elapsed_realtime_ns,session_elapsed_ns,trigger_time_ns,camera_frame_ns,frame_delta_us,player,recognized_hit,training_label,recognition_mode,target_distance,r,g,b,h,s,v,p0_r,p0_g,p0_b,p1_r,p1_g,p1_b,p2_r,p2_g,p2_b,p3_r,p3_g,p3_b,p4_r,p4_g,p4_b,patch_size,patch_rgb_hex,elevation_deg,camera_id,width,height,sample_mode,ammo,capacity,score,target_profile"
         const val SAMPLE_CENTER = "center"
         const val SAMPLE_FIVE = "five"
         private const val PREF_CAMERA_ID = "camera.id"
@@ -1388,6 +1500,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         private const val RELOAD_GATE_MS = 5000L
         private const val TARGET_CALIBRATION_SHOTS = 10
         private const val AIM_PATCH_SIZE = 11
+        private const val AIM_RING_SIZE = 3
         private const val CALIBRATION_MIN_ACCEL = 3.0f
         private const val RELOAD_DURATION_MS = 1250L
         private const val MIN_RECORDING_MS = 850L

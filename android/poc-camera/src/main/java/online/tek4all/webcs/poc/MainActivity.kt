@@ -43,13 +43,13 @@ class MainActivity : ComponentActivity() {
     private lateinit var decisionText: TextView
     private lateinit var scoreText: TextView
     private lateinit var ammoText: TextView
-    private lateinit var ecoButton: Button
+    private lateinit var previewButton: Button
     private lateinit var recText: TextView
     private lateinit var aimZoomView: AimZoomView
 
     private var cameraService: CameraForegroundService? = null
     private var isBound = false
-    private var eco = false
+    private var previewVisible = true
 
     private val listener = object : CameraForegroundService.Listener {
         override fun onReady(score: Int, recording: Boolean) {
@@ -227,13 +227,14 @@ class MainActivity : ComponentActivity() {
             text = "REC"
             setOnClickListener { toggleRecording() }
         }
-        ecoButton = Button(this).apply {
-            text = "MODE ÉCO"
-            setOnClickListener { toggleEco() }
+        previewButton = Button(this).apply {
+            text = "APERÇU OFF"
+            contentDescription = "Couper uniquement l'affichage vidéo sans arrêter la caméra"
+            setOnClickListener { togglePreview() }
         }
         row.addView(fireButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(recButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(ecoButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(previewButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         panel.addView(row)
 
         val reloadButton = Button(this).apply {
@@ -349,9 +350,10 @@ class MainActivity : ComponentActivity() {
             contentDescription = "Effacer les événements de test et démarrer une nouvelle session"
         }
         content.addView(newSessionButton)
+        content.addView(label("Chaque tir est sauvegardé automatiquement avec la frame caméra la plus proche, les pixels centraux, le résultat de reconnaissance et les timestamps. Le CSV sert à l'entraînement et à l'arbitrage."))
         val shareDataButton = Button(this).apply {
-            text = "PARTAGER CSV D'ARBITRAGE"
-            contentDescription = "Exporter et partager les tirs et valeurs de visée"
+            text = "PARTAGER DATA ENTRAÎNEMENT / ARBITRAGE"
+            contentDescription = "Exporter et partager les données de tirs, reconnaissance et entraînement"
         }
         content.addView(shareDataButton)
 
@@ -494,7 +496,7 @@ class MainActivity : ComponentActivity() {
                         clipData = android.content.ClipData.newRawUri("WebCS arbitrage", uri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
-                    startActivity(Intent.createChooser(share, "Partager les données WebCS"))
+                    startActivity(Intent.createChooser(share, "Partager les données entraînement / arbitrage WebCS"))
                     dataSummary.text = service.sessionDataSummary()
                 }
             }
@@ -510,6 +512,12 @@ class MainActivity : ComponentActivity() {
             }
 
             calibrateButton.setOnClickListener {
+                if (!previewVisible) {
+                    previewVisible = true
+                    previewView.visibility = View.VISIBLE
+                    service.setPreviewEnabled(true, previewView.surfaceProvider)
+                    previewButton.text = "APERÇU OFF"
+                }
                 service.startCalibration()
                 dialog.dismiss()
             }
@@ -549,11 +557,19 @@ class MainActivity : ComponentActivity() {
         cameraService?.toggleRecording() ?: run { statusText.text = "Service caméra pas encore prêt." }
     }
 
-    private fun toggleEco() {
-        eco = !eco
-        previewView.alpha = if (eco) 0.03f else 1f
-        ecoButton.text = if (eco) "APERÇU NORMAL" else "MODE ÉCO"
-        statusText.text = if (eco) "Mode éco : aperçu presque noir. Le service caméra reste actif." else "Aperçu normal."
+    private fun togglePreview() {
+        previewVisible = !previewVisible
+        if (previewVisible) {
+            previewView.visibility = View.VISIBLE
+            cameraService?.setPreviewEnabled(true, previewView.surfaceProvider)
+            previewButton.text = "APERÇU OFF"
+            statusText.text = "Aperçu ON · affichage vidéo réactivé sans redémarrer la caméra."
+        } else {
+            cameraService?.setPreviewEnabled(false)
+            previewView.visibility = View.INVISIBLE
+            previewButton.text = "APERÇU ON"
+            statusText.text = "Aperçu OFF · la caméra reste chaude et le buffer de visée continue."
+        }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
