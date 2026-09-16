@@ -19,9 +19,11 @@ import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.ComponentActivity
@@ -39,6 +41,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var statusText: TextView
     private lateinit var decisionText: TextView
     private lateinit var scoreText: TextView
+    private lateinit var ammoText: TextView
     private lateinit var ecoButton: Button
     private lateinit var recText: TextView
 
@@ -50,7 +53,11 @@ class MainActivity : ComponentActivity() {
         override fun onReady(score: Int, recording: Boolean) {
             scoreText.text = "Score $score"
             recText.visibility = if (recording) View.VISIBLE else View.GONE
-            statusText.text = cameraService?.configurationSummary()
+            val service = cameraService
+            if (service != null) {
+                onAmmo(service.currentAmmo(), service.currentMagazineSize(), service.isReloading())
+            }
+            statusText.text = service?.configurationSummary()
                 ?: "Caméra de fond prête. Volume - : tir · Volume + : REC/STOP."
         }
 
@@ -70,6 +77,10 @@ class MainActivity : ComponentActivity() {
         override fun onStatus(message: String) {
             statusText.text = message
         }
+
+        override fun onAmmo(ammo: Int, capacity: Int, reloading: Boolean) {
+            ammoText.text = if (reloading) "Chargeur $ammo/$capacity · rechargement…" else "Chargeur $ammo/$capacity"
+        }
     }
 
     private val connection = object : ServiceConnection {
@@ -80,7 +91,8 @@ class MainActivity : ComponentActivity() {
                 it.attachPreview(previewView.surfaceProvider)
             }
             isBound = true
-            listener.onReady(cameraService?.currentScore() ?: 0, cameraService?.isRecording() == true)
+            val service = cameraService
+            listener.onReady(service?.currentScore() ?: 0, service?.isRecording() == true)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -184,9 +196,11 @@ class MainActivity : ComponentActivity() {
         }
         decisionText = textView("PRÊT", 24f)
         scoreText = textView("Score 0", 20f)
+        ammoText = textView("Chargeur --/--", 17f)
         statusText = textView("Initialisation…", 15f)
         panel.addView(decisionText)
         panel.addView(scoreText)
+        panel.addView(ammoText)
         panel.addView(statusText)
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -207,6 +221,13 @@ class MainActivity : ComponentActivity() {
         row.addView(ecoButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         panel.addView(row)
 
+        val reloadButton = Button(this).apply {
+            text = "RECHARGER"
+            contentDescription = "Recharger le chargeur"
+            setOnClickListener { cameraService?.reloadMagazine() }
+        }
+        panel.addView(reloadButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
         root.addView(panel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         ViewCompat.setOnApplyWindowInsetsListener(panel) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -225,7 +246,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (service.isRecording()) {
-            statusText.text = "Arrête le REC avant d'ouvrir les réglages caméra."
+            statusText.text = "Arrête le REC avant d'ouvrir les réglages."
             return
         }
 
@@ -273,17 +294,67 @@ class MainActivity : ComponentActivity() {
         val qualitySpinner = Spinner(this)
         content.addView(qualitySpinner)
 
+        content.addView(label("Effets sonores"))
+        val sfxCheck = CheckBox(this).apply {
+            text = "Activer tir, chargeur vide et rechargement"
+            isChecked = snapshot.sfxEnabled
+        }
+        content.addView(sfxCheck)
+
+        val volumeLabel = label("Volume effets : ${snapshot.sfxVolume}%")
+        content.addView(volumeLabel)
+        val volumeSeek = SeekBar(this).apply {
+            max = 100
+            progress = snapshot.sfxVolume
+        }
+        content.addView(volumeSeek)
+        volumeSeek.setOnSeekBarChangeListener(simpleSeekListener { value -> volumeLabel.text = "Volume effets : $value%" })
+
+        content.addView(label("Chargeur"))
+        val magazineValues = listOf(6, 12, 20, 30)
+        val magazineSpinner = Spinner(this)
+        magazineSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, magazineValues.map { "$it coups" }).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        val magIndex = magazineValues.indexOf(snapshot.magazineSize).let { if (it >= 0) it else 1 }
+        magazineSpinner.setSelection(magIndex)
+        content.addView(magazineSpinner)
+
+        content.addView(label("Déclenchement par mouvement"))
+        val gestureCheck = CheckBox(this).apply {
+            text = "Tirer avec un à-coup rapide calibré"
+            isChecked = snapshot.gestureEnabled
+        }
+        content.addView(gestureCheck)
+
+        val sensitivityLabel = label("Sensibilité mouvement : ${snapshot.gestureSensitivity}%")
+        content.addView(sensitivityLabel)
+        val sensitivitySeek = SeekBar(this).apply {
+            max = 100
+            progress = snapshot.gestureSensitivity
+        }
+        content.addView(sensitivitySeek)
+        sensitivitySeek.setOnSeekBarChangeListener(simpleSeekListener { value -> sensitivityLabel.text = "Sensibilité mouvement : $value%" })
+
+        val gestureProfileText = label(service.gestureCalibrationSummary())
+        content.addView(gestureProfileText)
+        val gestureCalibrateButton = Button(this).apply {
+            text = "CALIBRER MON GESTE DE TIR · 5 FOIS"
+            contentDescription = "Calibrer le tir par mouvement"
+        }
+        content.addView(gestureCalibrateButton)
+
         val effectiveText = label("Résolution effective actuelle : ${if (snapshot.effectiveWidth > 0) "${snapshot.effectiveWidth}×${snapshot.effectiveHeight}" else "en attente"}")
         content.addView(effectiveText)
 
         val profileText = label(service.calibrationSummary())
         content.addView(profileText)
 
-        val calibrateButton = Button(this).apply { text = "ÉTALONNER CE PROFIL" }
+        val calibrateButton = Button(this).apply { text = "ÉTALONNER CE PROFIL CAMÉRA" }
         content.addView(calibrateButton)
 
         val quitButton = Button(this).apply {
-            text = "QUITTER WEB CS"
+            text = "QUITTER WEB CS"
             setTextColor(Color.rgb(180, 30, 30))
         }
         content.addView(quitButton)
@@ -326,7 +397,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val dialog = AlertDialog.Builder(this)
-            .setTitle("WebCS · réglages caméra")
+            .setTitle("WebCS · réglages")
             .setView(scroll)
             .setPositiveButton("APPLIQUER", null)
             .setNegativeButton("FERMER", null)
@@ -338,9 +409,26 @@ class MainActivity : ComponentActivity() {
                 val resolution = resolutionOptions[resolutionSpinner.selectedItemPosition]
                 val sampleMode = if (sampleSpinner.selectedItemPosition == 0) CameraForegroundService.SAMPLE_CENTER else CameraForegroundService.SAMPLE_FIVE
                 val quality = qualityOptions[qualitySpinner.selectedItemPosition]
-                if (service.applySettings(camera.id, resolution.width, resolution.height, sampleMode, quality.key)) {
+                val magazineSize = magazineValues[magazineSpinner.selectedItemPosition]
+                if (service.applySettings(
+                        camera.id,
+                        resolution.width,
+                        resolution.height,
+                        sampleMode,
+                        quality.key,
+                        sfxCheck.isChecked,
+                        volumeSeek.progress,
+                        gestureCheck.isChecked,
+                        sensitivitySeek.progress,
+                        magazineSize
+                    )) {
                     dialog.dismiss()
                 }
+            }
+
+            gestureCalibrateButton.setOnClickListener {
+                service.startGestureCalibration()
+                dialog.dismiss()
             }
 
             calibrateButton.setOnClickListener {
@@ -354,6 +442,12 @@ class MainActivity : ComponentActivity() {
             }
         }
         dialog.show()
+    }
+
+    private fun simpleSeekListener(onProgress: (Int) -> Unit) = object : SeekBar.OnSeekBarChangeListener {
+        override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) = onProgress(progress)
+        override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+        override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
     }
 
     private fun shutdownApp() {
