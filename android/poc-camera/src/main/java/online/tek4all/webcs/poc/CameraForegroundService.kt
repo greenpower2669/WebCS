@@ -165,6 +165,11 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     private var targetSumG2 = 0.0
     private var targetSumB2 = 0.0
     private var patchFrameCounter = 0
+    @Volatile private var latestRawPoints: List<PointSample> = emptyList()
+    private val eventLog = mutableListOf<String>()
+    private var eventSequence = 0L
+    private var sessionId = makeSessionId()
+    private var sessionStartElapsedNs = SystemClock.elapsedRealtimeNanos()
 
     var listener: Listener? = null
 
@@ -375,6 +380,90 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     fun isTargetCalibrationActive(): Boolean = targetCalibrationRemaining > 0
 
+    fun currentPlayerName(): String = prefs.getString(PREF_PLAYER_NAME, "Joueur") ?: "Joueur"
+
+    fun setPlayerName(value: String) {
+        val clean = value.trim().take(40).ifBlank { "Joueur" }
+        prefs.edit().putString(PREF_PLAYER_NAME, clean).apply()
+    }
+
+    fun sessionDataSummary(): String {
+        val count = synchronized(eventLog) { eventLog.size }
+        return "Session $sessionId · $count événements · joueur ${currentPlayerName()}"
+    }
+
+    fun startNewDataSession() {
+        synchronized(eventLog) { eventLog.clear() }
+        eventSequence = 0L
+        sessionId = makeSessionId()
+        sessionStartElapsedNs = SystemClock.elapsedRealtimeNanos()
+        listener?.onStatus("Nouvelle session de données · $sessionId")
+    }
+
+    fun exportSessionCsv(): Uri? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            listener?.onStatus("Export CSV direct disponible à partir d'Android 10.")
+            return null
+        }
+        val rows = synchronized(eventLog) { eventLog.toList() }
+        val fileName = "WebCS-arbitrage-$sessionId.csv"
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
+            put(MediaStore.Downloads.RELATIVE_PATH, "Download/WebCS")
+        }
+        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+        return try {
+            contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8).use { writer ->
+                if (writer == null) throw IllegalStateException("sortie CSV indisponible")
+                writer.write("\uFEFF")
+                writer.appendLine(CSV_HEADER)
+                rows.forEach { writer.appendLine(it) }
+            }
+            listener?.onStatus("CSV prêt · $fileName · ${rows.size} événements.")
+            uri
+        } catch (e: Exception) {
+            try { contentResolver.delete(uri, null, null) } catch (_: Exception) { }
+            listener?.onStatus("Erreur export CSV : ${e.message ?: "inconnue"}")
+            null
+        }
+    }
+
+    private fun makeSessionId(): String =
+        SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date()) + "-" + (SystemClock.elapsedRealtime() % 100000L)
+
+    private fun csv(value: Any?): String {
+        val text = value?.toString() ?: ""
+        return if (text.contains(',') || text.contains('"') || text.contains('\n')) {
+            "\"" + text.replace("\"", "\"\"") + "\""
+        } else text
+    }
+
+    private fun logGameEvent(type: String, result: ScanResult? = latestResult, hit: Boolean? = null) {
+        val nowNs = SystemClock.elapsedRealtimeNanos()
+        val seq = ++eventSequence
+        val points = latestRawPoints.take(5)
+        val values = mutableListOf<String>()
+        values += listOf(
+            "1", sessionId, seq.toString(), type,
+            System.currentTimeMillis().toString(), nowNs.toString(), (nowNs - sessionStartElapsedNs).toString(),
+            currentPlayerName(), hit?.toString() ?: "",
+            result?.r?.toString() ?: "", result?.g?.toString() ?: "", result?.b?.toString() ?: "",
+            result?.h?.toString() ?: "", result?.s?.toString() ?: "", result?.v?.toString() ?: ""
+        )
+        for (i in 0 until 5) {
+            val p = points.getOrNull(i)
+            values += listOf(p?.r?.toString() ?: "", p?.g?.toString() ?: "", p?.b?.toString() ?: "")
+        }
+        values += listOf(
+            lastCameraElevationDeg?.toString() ?: "",
+            selectedCameraId(), effectiveWidth.toString(), effectiveHeight.toString(),
+            ammo.toString(), magazineSize().toString(), score.toString(), currentSettings().profileId
+        )
+        val row = values.joinToString(",") { csv(it) }
+        synchronized(eventLog) { eventLog.add(row) }
+    }
+
     fun startGestureCalibration() {
         calibratingReloadGesture = false
         if (motionSensor == null) {
@@ -456,6 +545,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             score++
             prefs.edit().putInt("score", score).apply()
         }
+        logGameEvent("shot", result, result.hit)
         val mode = if (result.total == 1) "centre" else "5 points"
         val details = "RGB ${result.r}/${result.g}/${result.b}   HSV ${result.h.roundToInt()}°/${(result.s * 100).roundToInt()}%/${(result.v * 100).roundToInt()}% · $mode · ${effectiveWidth}×${effectiveHeight} · munitions $ammo/${magazineSize()}"
         listener?.onShot(result.hit, result.blueVotes, result.total, score, details)
@@ -476,6 +566,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             return
         }
         reloading = true
+        logGameEvent("reload", latestResult, null)
         sfx.playReload()
         notifyAmmo()
         listener?.onStatus("Rechargement…")
@@ -711,6 +802,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val gap = max(2, (min(image.width, image.height) * 0.008f).roundToInt())
         val offsets = arrayOf(0 to 0, -gap to -gap, gap to -gap, -gap to gap, gap to gap)
         val points = offsets.map { (dx, dy) -> sample(image, cx + dx, cy + dy) }
+        latestRawPoints = points
         val centerOnly = prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) == SAMPLE_CENTER
         val used = if (centerOnly) listOf(points.first()) else points
         val targetVotes = used.count { matchesTarget(it.r, it.g, it.b) }
@@ -767,6 +859,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     private fun recordTargetCalibrationShot(result: ScanResult) {
         if (targetCalibrationRemaining <= 0) return
         targetCalibrationCount++
+        logGameEvent("target_calibration", result, null)
         targetSumR += result.r
         targetSumG += result.g
         targetSumB += result.b
@@ -851,10 +944,15 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         if (gestureCalibrationRemaining > 0) {
             handleGestureCalibration(now, x, y, z, magnitude)
         } else {
-            if (prefs.getBoolean(PREF_RELOAD_GESTURE_ENABLED, false) && hasReloadGestureCalibration()) {
+            val reloadReady = prefs.getBoolean(PREF_RELOAD_GESTURE_ENABLED, false) && hasReloadGestureCalibration()
+            val reloadContext = reloadReady && now <= reloadGateUntilMs
+            if (reloadReady) {
                 handleReloadGestureDetection(now, x, y, z)
             }
-            if (prefs.getBoolean(PREF_GESTURE_ENABLED, false) && hasGestureCalibration()) {
+            if (reloadContext) {
+                // L'orientation donne le sens du geste : dans cette fenêtre, aucun tir accidentel.
+                projectionImpulse = null
+            } else if (prefs.getBoolean(PREF_GESTURE_ENABLED, false) && hasGestureCalibration()) {
                 handleGestureDetection(now, x, y, z)
             }
         }
@@ -891,8 +989,11 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         }
         if (upwardTurnAccumDeg >= UPWARD_TURN_MIN_DEG && now - upwardTurnStartMs <= UPWARD_TURN_WINDOW_MS) {
             reloadGateUntilMs = now + RELOAD_GATE_MS
+            projectionImpulse = null
+            reloadProjectionImpulse = null
             upwardTurnAccumDeg = 0f
             upwardTurnStartMs = now
+            logGameEvent("reload_gate", latestResult, null)
             if (prefs.getBoolean(PREF_RELOAD_GESTURE_ENABLED, false)) {
                 notifyStatus("Arme relevée · geste de recharge autorisé pendant 5 s.")
             }
@@ -963,20 +1064,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val threshold = max(2.0f, averagePeak * 0.45f)
 
         if (calibratingReloadGesture) {
-            if (hasGestureCalibration()) {
-                val sx = prefs.getFloat(PREF_GESTURE_AXIS_X, 0f)
-                val sy = prefs.getFloat(PREF_GESTURE_AXIS_Y, 0f)
-                val sz = prefs.getFloat(PREF_GESTURE_AXIS_Z, 0f)
-                val similarity = abs(dot(sx, sy, sz, axis[0], axis[1], axis[2]))
-                if (similarity > 0.82f) {
-                    calibratingReloadGesture = false
-                    gestureCalibrationRemaining = 0
-                    speak("geste trop proche du tir")
-                    notifyStatus("Recharge non enregistrée : geste trop proche du tir. Recalibre avec une direction différente, par exemple bas-haut.")
-                    updateSensorRegistration()
-                    return
-                }
-            }
+            // Le geste peut ressembler au tir : la transition vers le haut ouvre seule le contexte recharge.
             prefs.edit()
                 .putFloat(PREF_RELOAD_GESTURE_AXIS_X, axis[0])
                 .putFloat(PREF_RELOAD_GESTURE_AXIS_Y, axis[1])
@@ -988,7 +1076,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             calibratingReloadGesture = false
             updateSensorRegistration()
             speak("rechargement calibré")
-            notifyStatus("Calibration recharge terminée · geste activé. Le FX de rechargement jouera à chaque recharge valide.")
+            notifyStatus("Calibration recharge terminée · geste activé. Il ne rechargera qu'après une rotation vers le haut (fenêtre 5 s).")
         } else {
             prefs.edit()
                 .putFloat(PREF_GESTURE_AXIS_X, axis[0])
@@ -1260,6 +1348,8 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     companion object {
         private const val WEBSC_V070 = true
+        private const val WEBSC_V080 = "context-reload-data-v1"
+        private const val CSV_HEADER = "schema_version,session_id,seq,event,wall_time_ms,elapsed_realtime_ns,session_elapsed_ns,player,hit,r,g,b,h,s,v,p0_r,p0_g,p0_b,p1_r,p1_g,p1_b,p2_r,p2_g,p2_b,p3_r,p3_g,p3_b,p4_r,p4_g,p4_b,elevation_deg,camera_id,width,height,ammo,capacity,score,target_profile"
         const val SAMPLE_CENTER = "center"
         const val SAMPLE_FIVE = "five"
         private const val PREF_CAMERA_ID = "camera.id"
@@ -1270,6 +1360,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         private const val PREF_SFX_ENABLED = "game.sfxEnabled"
         private const val PREF_SFX_VOLUME = "game.sfxVolume"
         private const val PREF_MAGAZINE_SIZE = "game.magazineSize"
+        private const val PREF_PLAYER_NAME = "game.playerName"
         private const val PREF_GESTURE_ENABLED = "game.gestureEnabled"
         private const val PREF_GESTURE_SENSITIVITY = "game.gestureSensitivity"
         private const val PREF_GESTURE_AXIS_X = "gesture.axisX"

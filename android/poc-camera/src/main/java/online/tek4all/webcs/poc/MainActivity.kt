@@ -20,6 +20,7 @@ import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -334,6 +335,26 @@ class MainActivity : ComponentActivity() {
         magazineSpinner.setSelection(magIndex)
         content.addView(magazineSpinner)
 
+        content.addView(label("Données / arbitrage"))
+        val playerEdit = EditText(this).apply {
+            hint = "Nom du joueur"
+            setText(service.currentPlayerName())
+            contentDescription = "Nom du joueur dans les données WebCS"
+        }
+        content.addView(playerEdit)
+        val dataSummary = label(service.sessionDataSummary())
+        content.addView(dataSummary)
+        val newSessionButton = Button(this).apply {
+            text = "NOUVELLE SESSION DATA"
+            contentDescription = "Effacer les événements de test et démarrer une nouvelle session"
+        }
+        content.addView(newSessionButton)
+        val shareDataButton = Button(this).apply {
+            text = "PARTAGER CSV D'ARBITRAGE"
+            contentDescription = "Exporter et partager les tirs et valeurs de visée"
+        }
+        content.addView(shareDataButton)
+
         content.addView(label("Déclenchement par mouvement"))
         val gestureCheck = CheckBox(this).apply {
             text = "Tirer avec un à-coup rapide calibré"
@@ -438,6 +459,7 @@ class MainActivity : ComponentActivity() {
                 val sampleMode = if (sampleSpinner.selectedItemPosition == 0) CameraForegroundService.SAMPLE_CENTER else CameraForegroundService.SAMPLE_FIVE
                 val quality = qualityOptions[qualitySpinner.selectedItemPosition]
                 val magazineSize = magazineValues[magazineSpinner.selectedItemPosition]
+                service.setPlayerName(playerEdit.text.toString())
                 if (service.applySettings(
                         camera.id,
                         resolution.width,
@@ -452,6 +474,28 @@ class MainActivity : ComponentActivity() {
                         magazineSize
                     )) {
                     dialog.dismiss()
+                }
+            }
+
+            newSessionButton.setOnClickListener {
+                service.setPlayerName(playerEdit.text.toString())
+                service.startNewDataSession()
+                dataSummary.text = service.sessionDataSummary()
+            }
+
+            shareDataButton.setOnClickListener {
+                service.setPlayerName(playerEdit.text.toString())
+                val uri = service.exportSessionCsv()
+                if (uri != null) {
+                    val share = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/csv"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        putExtra(Intent.EXTRA_TEXT, service.sessionDataSummary())
+                        clipData = android.content.ClipData.newRawUri("WebCS arbitrage", uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(Intent.createChooser(share, "Partager les données WebCS"))
+                    dataSummary.text = service.sessionDataSummary()
                 }
             }
 
