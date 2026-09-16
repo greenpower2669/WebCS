@@ -8,8 +8,6 @@ on:
       - 'settings.gradle.kts'
       - 'gradle.properties'
       - 'tools/hotfix_camera_analysis.py'
-      - 'tools/add_reload_gesture.py'
-      - 'tools/add_orientation_target_calibration.py'
       - 'tools/add_context_reload_data.py'
       - '.github/workflows/android-apk.yml'
   workflow_dispatch:
@@ -26,12 +24,6 @@ jobs:
 
       - name: Apply CameraX analysis hotfix
         run: python3 tools/hotfix_camera_analysis.py
-
-      - name: Add calibrated reload gesture
-        run: python3 tools/add_reload_gesture.py
-
-      - name: Add orientation gate and enemy target calibration
-        run: python3 tools/add_orientation_target_calibration.py
 
       - name: Add contextual reload and arbitration data
         run: python3 tools/add_context_reload_data.py
