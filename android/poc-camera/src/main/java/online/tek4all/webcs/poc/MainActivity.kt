@@ -394,6 +394,15 @@ class MainActivity : ComponentActivity() {
         }
         content.addView(reloadGestureCalibrateButton)
 
+        val orientationProfileText = label(service.orientationCalibrationSummary())
+        content.addView(orientationProfileText)
+        content.addView(label("Orientation recharge : 1) téléphone à plat caméra vers le haut, 2) au bip redresse-le en position prête à tirer. Le mode RECHARGE dure ensuite 5 s, puis retour automatique au TIR."))
+        val orientationCalibrateButton = Button(this).apply {
+            text = "CALIBRER ORIENTATION RECHARGE"
+            contentDescription = "Calibrer la position à plat et la position prête à tirer"
+        }
+        content.addView(orientationCalibrateButton)
+
         val effectiveText = label("Résolution effective actuelle : ${if (snapshot.effectiveWidth > 0) "${snapshot.effectiveWidth}×${snapshot.effectiveHeight}" else "en attente"}")
         content.addView(effectiveText)
 
@@ -508,6 +517,11 @@ class MainActivity : ComponentActivity() {
 
             reloadGestureCalibrateButton.setOnClickListener {
                 service.startReloadGestureCalibration()
+                dialog.dismiss()
+            }
+
+            orientationCalibrateButton.setOnClickListener {
+                service.startOrientationCalibration()
                 dialog.dismiss()
             }
 
