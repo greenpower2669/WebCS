@@ -1,0 +1,53 @@
+from pathlib import Path
+import base64
+
+SERVICE = Path("android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt")
+GRADLE = Path("android/poc-camera/build.gradle.kts")
+RAW_DIR = Path("android/poc-camera/src/main/res/raw")
+SFX_DIR = Path("tools/sfx")
+
+
+def replace_once(text: str, old: str, new: str, label: str) -> str:
+    if old in text:
+        return text.replace(old, new, 1)
+    if new in text:
+        return text
+    raise SystemExit(f"Pattern not found for {label}")
+
+
+# --- Decode user-provided audio resources for the Android build -----------------
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+for src_name, dst_name in (("tir.ogg.b64", "tir.ogg"), ("reload.ogg.b64", "reload.ogg")):
+    src = SFX_DIR / src_name
+    dst = RAW_DIR / dst_name
+    data = base64.b64decode(src.read_text(encoding="utf-8").strip())
+    if not data.startswith(b"OggS"):
+        raise SystemExit(f"Invalid OGG payload in {src}")
+    dst.write_bytes(data)
+    print(f"Decoded {src} -> {dst} ({len(data)} bytes)")
+
+
+# --- Wire SfxEngine with Context and play reward only on validated hits ----------
+service = SERVICE.read_text(encoding="utf-8")
+service = replace_once(
+    service,
+    "sfx = SfxEngine().also {",
+    "sfx = SfxEngine(this).also {",
+    "SfxEngine context",
+)
+service = replace_once(
+    service,
+    '''        if (result.hit) {\n            score++\n            prefs.edit().putInt("score", score).apply()\n        }''',
+    '''        if (result.hit) {\n            score++\n            prefs.edit().putInt("score", score).apply()\n            sfx.playHitReward()\n        }''',
+    "hit reward",
+)
+SERVICE.write_text(service, encoding="utf-8")
+
+
+# --- Version --------------------------------------------------------------------
+gradle = GRADLE.read_text(encoding="utf-8")
+gradle = replace_once(gradle, 'versionCode = 11', 'versionCode = 12', 'versionCode')
+gradle = replace_once(gradle, 'versionName = "0.10.0"', 'versionName = "0.10.1"', 'versionName')
+GRADLE.write_text(gradle, encoding="utf-8")
+
+print("WebCS v0.10.1 user SFX integration applied")
