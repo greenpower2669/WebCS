@@ -8,7 +8,6 @@ on:
       - 'settings.gradle.kts'
       - 'gradle.properties'
       - 'tools/hotfix_camera_analysis.py'
-      - 'tools/add_hot_stream_training.py'
       - 'tools/add_user_sfx.py'
       - 'tools/add_data_import_bluetooth.py'
       - 'tools/sfx/**'
@@ -28,10 +27,7 @@ jobs:
       - name: Apply CameraX analysis hotfix
         run: python3 tools/hotfix_camera_analysis.py
 
-      - name: Add hot stream and training data
-        run: python3 tools/add_hot_stream_training.py
-
-      - name: Add user shot reload and hit reward sounds
+      - name: Prepare user shot and reload sounds
         run: python3 tools/add_user_sfx.py
 
       - name: Add data import and direct Bluetooth sharing
