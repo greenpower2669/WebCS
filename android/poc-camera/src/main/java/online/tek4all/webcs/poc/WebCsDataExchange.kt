@@ -75,6 +75,53 @@ class WebCsDataExchange(context: Context) {
         return "Imports : ${files.size} dataset(s) · dernier ${files.first().name}"
     }
 
+    fun recentSessionSummaries(limit: Int = 10): List<String> {
+        val files = trainingDir().listFiles { f -> f.isFile && f.name.endsWith(".csv", ignoreCase = true) }
+            ?.sortedByDescending { it.lastModified() }
+            .orEmpty()
+        return files.take(limit.coerceIn(1, 30)).mapNotNull { summarizeSession(it) }
+    }
+
+    private fun summarizeSession(file: File): String? {
+        val lines = try {
+            file.readLines(Charsets.UTF_8).filter { it.isNotBlank() }
+        } catch (_: Exception) {
+            return null
+        }
+        if (lines.isEmpty()) return null
+        val header = parseCsvLine(lines.first().removePrefix("\uFEFF"))
+        val eventIndex = header.indexOf("event")
+        val playerIndex = header.indexOf("player")
+        val hitIndex = header.indexOf("recognized_hit")
+        val scoreIndex = header.indexOf("score")
+        val sessionIndex = header.indexOf("session_id")
+        if (eventIndex < 0) return null
+
+        var player = "Joueur"
+        var session = file.name.removePrefix("WebCS-training-").removeSuffix(".csv")
+        var shots = 0
+        var hits = 0
+        var score = 0
+        var ended = false
+
+        for (line in lines.drop(1)) {
+            val cols = parseCsvLine(line)
+            if (eventIndex >= cols.size) continue
+            if (playerIndex in cols.indices && cols[playerIndex].isNotBlank()) player = cols[playerIndex]
+            if (sessionIndex in cols.indices && cols[sessionIndex].isNotBlank()) session = cols[sessionIndex]
+            if (scoreIndex in cols.indices) score = cols[scoreIndex].toIntOrNull() ?: score
+            when (cols[eventIndex]) {
+                "shot" -> {
+                    shots++
+                    if (hitIndex in cols.indices && cols[hitIndex].equals("true", ignoreCase = true)) hits++
+                }
+                "game_end" -> ended = true
+            }
+        }
+        val state = if (ended) "terminée" else "en cours"
+        return "$player · score $score · $hits/$shots touchés · $state · $session"
+    }
+
     fun reuseLatestImportedCalibration(targetProfile: String): String {
         val latestPath = prefs.getString(PREF_LATEST_IMPORT, null)
             ?: return "Aucun dataset importé à réutiliser."
@@ -98,21 +145,49 @@ class WebCsDataExchange(context: Context) {
         val rIndex = header.indexOf("r")
         val gIndex = header.indexOf("g")
         val bIndex = header.indexOf("b")
+        val toleranceIndex = header.indexOf("target_tolerance")
         if (eventIndex < 0 || rIndex < 0 || gIndex < 0 || bIndex < 0) {
             return "Dataset incompatible avec la réutilisation de calibration."
         }
 
         val refs = mutableListOf<Triple<Double, Double, Double>>()
+        var snapshotR: Double? = null
+        var snapshotG: Double? = null
+        var snapshotB: Double? = null
+        var snapshotTolerance: Double? = null
         for (line in lines.drop(1)) {
             val cols = parseCsvLine(line)
             if (cols.size <= maxOf(eventIndex, rIndex, gIndex, bIndex)) continue
             val event = cols[eventIndex]
             val label = if (labelIndex >= 0 && labelIndex < cols.size) cols[labelIndex] else ""
-            if (event != "target_calibration" && label != "enemy_reference") continue
-            val r = cols[rIndex].toDoubleOrNull() ?: continue
-            val g = cols[gIndex].toDoubleOrNull() ?: continue
-            val b = cols[bIndex].toDoubleOrNull() ?: continue
+            val r = cols[rIndex].toDoubleOrNull()
+            val g = cols[gIndex].toDoubleOrNull()
+            val b = cols[bIndex].toDoubleOrNull()
+
+            if (event == "target_calibration_snapshot" && r != null && g != null && b != null) {
+                val tolerance = if (toleranceIndex in cols.indices) cols[toleranceIndex].toDoubleOrNull() else null
+                if (tolerance != null) {
+                    snapshotR = r
+                    snapshotG = g
+                    snapshotB = b
+                    snapshotTolerance = tolerance
+                }
+                continue
+            }
+
+            if (event != "target_calibration" && !label.startsWith("enemy_reference")) continue
+            if (r == null || g == null || b == null) continue
             refs += Triple(r, g, b)
+        }
+
+        if (snapshotR != null && snapshotG != null && snapshotB != null && snapshotTolerance != null) {
+            prefs.edit()
+                .putInt("target.$targetProfile.r", snapshotR.toInt().coerceIn(0, 255))
+                .putInt("target.$targetProfile.g", snapshotG.toInt().coerceIn(0, 255))
+                .putInt("target.$targetProfile.b", snapshotB.toInt().coerceIn(0, 255))
+                .putFloat("target.$targetProfile.tolerance", snapshotTolerance.toFloat().coerceIn(1f, 255f))
+                .apply()
+            return "Calibration réutilisée depuis un snapshot exporté · RGB ${snapshotR.toInt()}/${snapshotG.toInt()}/${snapshotB.toInt()} · tolérance ${snapshotTolerance.toInt()}."
         }
 
         if (refs.size < 3) {
