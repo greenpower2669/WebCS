@@ -755,7 +755,7 @@ class MainActivity : ComponentActivity() {
             .create()
         pairingDialog.setOnShowListener {
             pairingDialog.listView.setOnItemClickListener { _, _, which, _ ->
-                val device = devices.values.getOrNull(which) ?: return@setOnItemClickListener
+                val device = devices.values.elementAtOrNull(which) ?: return@setOnItemClickListener
                 if (device.bonded) {
                     statusText.text = "${device.name} est déjà appairé et prêt pour WebCS."
                 } else {
