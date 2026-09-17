@@ -76,6 +76,12 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val label: String get() = "${width}×${height}"
     }
     data class QualityOption(val key: String, val label: String)
+    data class RefereeShot(
+        val seq: Long,
+        val recognizedHit: Boolean,
+        val wallTimeMs: Long,
+        val player: String
+    )
     data class SettingsSnapshot(
         val cameraId: String,
         val requestedWidth: Int,
@@ -185,6 +191,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     private var patchFrameCounter = 0
     @Volatile private var latestRawPoints: List<PointSample> = emptyList()
     private val eventLog = mutableListOf<String>()
+    private val refereeShots = ArrayDeque<RefereeShot>()
     private var eventSequence = 0L
     private var sessionId = makeSessionId()
     private var sessionStartElapsedNs = SystemClock.elapsedRealtimeNanos()
@@ -437,6 +444,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     fun startNewDataSession() {
         synchronized(eventLog) { eventLog.clear() }
+        synchronized(refereeShots) { refereeShots.clear() }
         eventSequence = 0L
         sessionId = makeSessionId()
         sessionStartElapsedNs = SystemClock.elapsedRealtimeNanos()
@@ -468,6 +476,27 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         listener?.onReady(score, isRecording())
         notifyAmmo()
         notifyStatus("Nouvelle partie · score 0 · chargeur ${ammo}/${magazineSize()} · partie précédente conservée (score $previousScore, munitions $previousAmmo).")
+    }
+
+    fun recentRefereeShots(limit: Int = 20): List<RefereeShot> = synchronized(refereeShots) {
+        refereeShots.toList().takeLast(limit.coerceIn(1, 50)).asReversed()
+    }
+
+    fun recordRefereeDecision(refSeq: Long, humanHit: Boolean) {
+        val exists = synchronized(refereeShots) { refereeShots.any { it.seq == refSeq } }
+        if (!exists) {
+            notifyStatus("Arbitre : tir #$refSeq introuvable dans la partie courante.")
+            return
+        }
+        logGameEvent(
+            type = "referee_label",
+            result = latestResult,
+            hit = null,
+            trainingLabel = if (humanHit) "referee_hit" else "referee_miss",
+            refSeq = refSeq,
+            refereeHit = humanHit
+        )
+        notifyStatus("Arbitre : tir #$refSeq marqué ${if (humanHit) "TOUCHÉ" else "RATÉ"} · événement original conservé.")
     }
 
     fun recordImportedCalibrationSnapshot() {
@@ -566,8 +595,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         hit: Boolean? = null,
         frame: AimFrame? = null,
         triggerNs: Long? = null,
-        trainingLabel: String = ""
-    ) {
+        trainingLabel: String = "",
+        refSeq: Long? = null,
+        refereeHit: Boolean? = null
+    ): Long {
         val nowNs = SystemClock.elapsedRealtimeNanos()
         val chosenFrame = frame ?: nearestAimFrame(triggerNs ?: nowNs)
         val trigger = triggerNs ?: nowNs
@@ -597,11 +628,14 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             ammo.toString(), magazineSize().toString(), score.toString(), currentSettings().profileId,
             if (prefs.contains("target.${currentSettings().profileId}.tolerance")) {
                 prefs.getFloat("target.${currentSettings().profileId}.tolerance", 42f).toString()
-            } else ""
+            } else "",
+            refSeq?.toString() ?: "",
+            refereeHit?.toString() ?: ""
         )
         val row = values.joinToString(",") { csv(it) }
         synchronized(eventLog) { eventLog.add(row) }
         persistSessionRow(row)
+        return seq
     }
 
     fun startGestureCalibration() {
@@ -727,7 +761,11 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             prefs.edit().putInt("score", score).apply()
             sfx.playHitReward()
         }
-        logGameEvent("shot", result, result.hit, frame, triggerNs)
+        val shotSeq = logGameEvent("shot", result, result.hit, frame, triggerNs)
+        synchronized(refereeShots) {
+            refereeShots.addLast(RefereeShot(shotSeq, result.hit, System.currentTimeMillis(), currentPlayerName()))
+            while (refereeShots.size > 50) refereeShots.removeFirst()
+        }
         val mode = if (result.total == 1) "centre" else "5 points"
         val details = "RGB ${result.r}/${result.g}/${result.b}   HSV ${result.h.roundToInt()}°/${(result.s * 100).roundToInt()}%/${(result.v * 100).roundToInt()}% · $mode · frame Δ ${deltaUs} µs · ${effectiveWidth}×${effectiveHeight} · munitions $ammo/${magazineSize()}"
         listener?.onShot(result.hit, result.blueVotes, result.total, score, details)
@@ -1718,7 +1756,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         private const val WEBSC_V080 = "context-reload-data-v1"
         private const val WEBSC_V090 = "hot-stream-shot-classification-training-v1"
         private const val WEBSC_V010 = "relative-orientation-calibration-v1"
-        private const val CSV_HEADER = "schema_version,session_id,seq,event,wall_time_ms,elapsed_realtime_ns,session_elapsed_ns,trigger_time_ns,camera_frame_ns,frame_delta_us,player,recognized_hit,training_label,recognition_mode,target_distance,r,g,b,h,s,v,p0_r,p0_g,p0_b,p1_r,p1_g,p1_b,p2_r,p2_g,p2_b,p3_r,p3_g,p3_b,p4_r,p4_g,p4_b,patch_size,patch_rgb_hex,elevation_deg,camera_id,width,height,sample_mode,ammo,capacity,score,target_profile,target_tolerance"
+        private const val CSV_HEADER = "schema_version,session_id,seq,event,wall_time_ms,elapsed_realtime_ns,session_elapsed_ns,trigger_time_ns,camera_frame_ns,frame_delta_us,player,recognized_hit,training_label,recognition_mode,target_distance,r,g,b,h,s,v,p0_r,p0_g,p0_b,p1_r,p1_g,p1_b,p2_r,p2_g,p2_b,p3_r,p3_g,p3_b,p4_r,p4_g,p4_b,patch_size,patch_rgb_hex,elevation_deg,camera_id,width,height,sample_mode,ammo,capacity,score,target_profile,target_tolerance,ref_seq,referee_hit"
         const val SAMPLE_CENTER = "center"
         const val SAMPLE_FIVE = "five"
         private const val PREF_CAMERA_ID = "camera.id"
