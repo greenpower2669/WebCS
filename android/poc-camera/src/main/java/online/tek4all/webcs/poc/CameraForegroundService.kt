@@ -200,7 +200,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         score = prefs.getInt("score", 0)
         cameraExecutor = Executors.newSingleThreadExecutor()
         tts = TextToSpeech(this, this)
-        sfx = SfxEngine().also {
+        sfx = SfxEngine(this).also {
             it.configure(prefs.getBoolean(PREF_SFX_ENABLED, true), prefs.getInt(PREF_SFX_VOLUME, 70))
         }
         ammo = magazineSize()
@@ -677,6 +677,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         if (result.hit) {
             score++
             prefs.edit().putInt("score", score).apply()
+            sfx.playHitReward()
         }
         logGameEvent("shot", result, result.hit, frame, triggerNs)
         val mode = if (result.total == 1) "centre" else "5 points"
