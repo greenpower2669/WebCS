@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.view.Gravity
@@ -38,6 +39,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+    // WEBSC_BT_DATA_V011
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
     private lateinit var decisionText: TextView
@@ -46,6 +48,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var previewButton: Button
     private lateinit var recText: TextView
     private lateinit var aimZoomView: AimZoomView
+    private lateinit var dataExchange: WebCsDataExchange
+    private lateinit var bluetoothTransport: BluetoothDataTransport
+    private var pendingBluetoothAction: (() -> Unit)? = null
 
     private var cameraService: CameraForegroundService? = null
     private var isBound = false
@@ -113,8 +118,23 @@ class MainActivity : ComponentActivity() {
         if (granted) startServiceAndBind() else statusText.text = "Autorisation caméra refusée."
     }
 
+    private val importDataPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null && ::dataExchange.isInitialized) {
+            val result = dataExchange.importCsv(uri)
+            statusText.text = result.message
+        }
+    }
+
+    private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val action = pendingBluetoothAction
+        pendingBluetoothAction = null
+        if (granted) action?.invoke() else statusText.text = "Autorisation Bluetooth refusée."
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        dataExchange = WebCsDataExchange(this)
+        bluetoothTransport = BluetoothDataTransport(this)
         buildUi()
         enterImmersiveMode()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -356,6 +376,29 @@ class MainActivity : ComponentActivity() {
             contentDescription = "Exporter et partager les données de tirs, reconnaissance et entraînement"
         }
         content.addView(shareDataButton)
+        val importedDataSummary = label(dataExchange.importedSummary())
+        content.addView(importedDataSummary)
+        val importDataButton = Button(this).apply {
+            text = "IMPORTER / RÉUTILISER UN CSV WEB CS"
+            contentDescription = "Importer un ancien dataset WebCS depuis un fichier"
+        }
+        content.addView(importDataButton)
+        val reuseCalibrationButton = Button(this).apply {
+            text = "RÉUTILISER CALIBRATION DU DERNIER IMPORT"
+            contentDescription = "Reconstruire la calibration de couleur avec les références cible du dernier dataset importé"
+        }
+        content.addView(reuseCalibrationButton)
+        content.addView(label("Bluetooth direct WebCS ↔ WebCS : les deux téléphones doivent être appairés. Sur le téléphone destinataire, lance RECEVOIR, puis ENVOYER sur l'autre."))
+        val bluetoothSendButton = Button(this).apply {
+            text = "ENVOYER DATA À WEB CS PAR BLUETOOTH"
+            contentDescription = "Envoyer la session courante directement à un autre téléphone WebCS appairé"
+        }
+        content.addView(bluetoothSendButton)
+        val bluetoothReceiveButton = Button(this).apply {
+            text = "RECEVOIR DATA WEB CS PAR BLUETOOTH"
+            contentDescription = "Attendre et importer un dataset envoyé par un autre téléphone WebCS appairé"
+        }
+        content.addView(bluetoothReceiveButton)
 
         content.addView(label("Déclenchement par mouvement"))
         val gestureCheck = CheckBox(this).apply {
@@ -510,6 +553,32 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            importDataButton.setOnClickListener {
+                importDataPicker.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.ms-excel"))
+            }
+
+            reuseCalibrationButton.setOnClickListener {
+                val message = dataExchange.reuseLatestImportedCalibration(service.currentSettings().profileId)
+                importedDataSummary.text = dataExchange.importedSummary()
+                profileText.text = service.calibrationSummary()
+                statusText.text = message
+            }
+
+            bluetoothSendButton.setOnClickListener {
+                service.setPlayerName(playerEdit.text.toString())
+                withBluetoothPermission {
+                    dialog.dismiss()
+                    showBluetoothSendPicker()
+                }
+            }
+
+            bluetoothReceiveButton.setOnClickListener {
+                withBluetoothPermission {
+                    dialog.dismiss()
+                    startBluetoothReceive()
+                }
+            }
+
             gestureCalibrateButton.setOnClickListener {
                 service.startGestureCalibration()
                 dialog.dismiss()
@@ -542,6 +611,73 @@ class MainActivity : ComponentActivity() {
             }
         }
         dialog.show()
+    }
+
+    private fun withBluetoothPermission(action: () -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        ) {
+            action()
+            return
+        }
+        pendingBluetoothAction = action
+        bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
+    }
+
+    private fun ensureBluetoothReady(): Boolean {
+        if (!bluetoothTransport.isAvailable()) {
+            statusText.text = "Bluetooth indisponible sur cet appareil."
+            return false
+        }
+        if (!bluetoothTransport.isEnabled()) {
+            statusText.text = "Active le Bluetooth puis relance l'envoi ou la réception WebCS."
+            try { startActivity(Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_ENABLE)) } catch (_: Exception) { }
+            return false
+        }
+        return true
+    }
+
+    private fun showBluetoothSendPicker() {
+        if (!ensureBluetoothReady()) return
+        val payload = dataExchange.currentSessionPayload()
+        if (payload == null) {
+            statusText.text = "Aucune session WebCS locale à envoyer."
+            return
+        }
+        val devices = bluetoothTransport.pairedDevices()
+        if (devices.isEmpty()) {
+            statusText.text = "Aucun appareil Bluetooth appairé. Appaire d'abord les deux téléphones dans Android."
+            return
+        }
+        val labels = devices.map { "${it.name} · ${it.address}" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Envoyer la session WebCS")
+            .setItems(labels) { _, which ->
+                val device = devices[which]
+                bluetoothTransport.send(
+                    device.address,
+                    payload.fileName,
+                    payload.bytes,
+                    onStatus = { message -> runOnUiThread { statusText.text = message } },
+                    onComplete = { _, message -> runOnUiThread { statusText.text = message } }
+                )
+            }
+            .setNegativeButton("ANNULER", null)
+            .show()
+    }
+
+    private fun startBluetoothReceive() {
+        if (!ensureBluetoothReady()) return
+        bluetoothTransport.startReceiver(
+            onStatus = { message -> runOnUiThread { statusText.text = message } },
+            onReceived = { fileName, bytes ->
+                val result = dataExchange.importCsvBytes(fileName, bytes)
+                runOnUiThread {
+                    statusText.text = if (result.ok) "Bluetooth · ${result.message}" else result.message
+                }
+            },
+            onError = { message -> runOnUiThread { statusText.text = message } }
+        )
     }
 
     private fun simpleSeekListener(onProgress: (Int) -> Unit) = object : SeekBar.OnSeekBarChangeListener {
@@ -603,6 +739,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (::bluetoothTransport.isInitialized) bluetoothTransport.close()
         if (isBound) {
             cameraService?.listener = null
             unbindService(connection)
