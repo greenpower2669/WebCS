@@ -4,7 +4,12 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import androidx.core.content.ContextCompat
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.util.UUID
@@ -12,11 +17,14 @@ import java.util.concurrent.Executors
 import java.util.zip.CRC32
 
 class BluetoothDataTransport(context: Context) {
+    // WEBSC_BT_PAIRING_V0111
     data class PairedDevice(val name: String, val address: String)
+    data class NearbyDevice(val name: String, val address: String, val bonded: Boolean)
 
     private val appContext = context.applicationContext
     private val executor = Executors.newCachedThreadPool()
     @Volatile private var serverSocket: BluetoothServerSocket? = null
+    @Volatile private var discoveryReceiver: BroadcastReceiver? = null
 
     private fun adapter(): BluetoothAdapter? = appContext.getSystemService(BluetoothManager::class.java)?.adapter
 
@@ -34,6 +42,96 @@ class BluetoothDataTransport(context: Context) {
                 .sortedBy { it.name.lowercase() }
         } catch (_: SecurityException) {
             emptyList()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startDiscovery(
+        onDevice: (NearbyDevice) -> Unit,
+        onStatus: (String) -> Unit,
+        onFinished: () -> Unit
+    ) {
+        stopDiscovery()
+        val bt = adapter() ?: run {
+            onStatus("Bluetooth indisponible sur cet appareil.")
+            onFinished()
+            return
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    BluetoothDevice.ACTION_FOUND, BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                        @Suppress("DEPRECATION")
+                        val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
+                        try {
+                            onDevice(
+                                NearbyDevice(
+                                    name = device.name ?: "Téléphone / appareil Bluetooth",
+                                    address = device.address,
+                                    bonded = device.bondState == BluetoothDevice.BOND_BONDED
+                                )
+                            )
+                        } catch (_: SecurityException) { }
+                    }
+                    BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> onFinished()
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        }
+        discoveryReceiver = receiver
+        try {
+            ContextCompat.registerReceiver(appContext, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+            pairedDevices().forEach { onDevice(NearbyDevice(it.name, it.address, true)) }
+            bt.cancelDiscovery()
+            if (bt.startDiscovery()) onStatus("Bluetooth · recherche des téléphones proches…")
+            else {
+                onStatus("Bluetooth · impossible de démarrer la recherche.")
+                stopDiscovery()
+                onFinished()
+            }
+        } catch (e: Exception) {
+            stopDiscovery()
+            onStatus("Bluetooth · recherche impossible : ${e.message ?: e.javaClass.simpleName}.")
+            onFinished()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun pairDevice(deviceAddress: String, onStatus: (String) -> Unit): Boolean {
+        val bt = adapter() ?: run {
+            onStatus("Bluetooth indisponible sur cet appareil.")
+            return false
+        }
+        return try {
+            val device = bt.getRemoteDevice(deviceAddress)
+            if (device.bondState == BluetoothDevice.BOND_BONDED) {
+                onStatus("${device.name ?: deviceAddress} est déjà appairé.")
+                true
+            } else {
+                val started = device.createBond()
+                onStatus(
+                    if (started) "Demande d'appairage envoyée · confirme le code Android sur les deux téléphones."
+                    else "Android n'a pas pu démarrer l'appairage."
+                )
+                started
+            }
+        } catch (e: Exception) {
+            onStatus("Appairage impossible : ${e.message ?: e.javaClass.simpleName}.")
+            false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopDiscovery() {
+        try { adapter()?.cancelDiscovery() } catch (_: Exception) { }
+        val receiver = discoveryReceiver
+        discoveryReceiver = null
+        if (receiver != null) {
+            try { appContext.unregisterReceiver(receiver) } catch (_: Exception) { }
         }
     }
 
@@ -137,6 +235,7 @@ class BluetoothDataTransport(context: Context) {
     }
 
     fun close() {
+        stopDiscovery()
         stopReceiver()
         executor.shutdownNow()
     }

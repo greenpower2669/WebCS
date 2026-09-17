@@ -40,6 +40,7 @@ import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     // WEBSC_BT_DATA_V011
+    // WEBSC_BT_PAIRING_V0111
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
     private lateinit var decisionText: TextView
@@ -51,6 +52,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var dataExchange: WebCsDataExchange
     private lateinit var bluetoothTransport: BluetoothDataTransport
     private var pendingBluetoothAction: (() -> Unit)? = null
+    private var pendingBluetoothScanAction: (() -> Unit)? = null
 
     private var cameraService: CameraForegroundService? = null
     private var isBound = false
@@ -129,6 +131,13 @@ class MainActivity : ComponentActivity() {
         val action = pendingBluetoothAction
         pendingBluetoothAction = null
         if (granted) action?.invoke() else statusText.text = "Autorisation Bluetooth refusée."
+    }
+
+    private val bluetoothScanPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        val action = pendingBluetoothScanAction
+        pendingBluetoothScanAction = null
+        if (grants.values.all { it }) action?.invoke()
+        else statusText.text = "Autorisation de recherche Bluetooth refusée."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -399,6 +408,11 @@ class MainActivity : ComponentActivity() {
             contentDescription = "Attendre et importer un dataset envoyé par un autre téléphone WebCS appairé"
         }
         content.addView(bluetoothReceiveButton)
+        val bluetoothPairButton = Button(this).apply {
+            text = "APPAIRER UN TÉLÉPHONE"
+            contentDescription = "Rechercher un téléphone proche et lancer l'appairage Bluetooth Android"
+        }
+        content.addView(bluetoothPairButton)
 
         content.addView(label("Déclenchement par mouvement"))
         val gestureCheck = CheckBox(this).apply {
@@ -579,6 +593,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            bluetoothPairButton.setOnClickListener {
+                withBluetoothScanPermission {
+                    dialog.dismiss()
+                    showBluetoothPairingDialog()
+                }
+            }
+
             gestureCalibrateButton.setOnClickListener {
                 service.startGestureCalibration()
                 dialog.dismiss()
@@ -624,6 +645,21 @@ class MainActivity : ComponentActivity() {
         bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
     }
 
+    private fun withBluetoothScanPermission(action: () -> Unit) {
+        val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        val missing = needed.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) {
+            action()
+            return
+        }
+        pendingBluetoothScanAction = action
+        bluetoothScanPermissions.launch(missing.toTypedArray())
+    }
+
     private fun ensureBluetoothReady(): Boolean {
         if (!bluetoothTransport.isAvailable()) {
             statusText.text = "Bluetooth indisponible sur cet appareil."
@@ -646,11 +682,12 @@ class MainActivity : ComponentActivity() {
         }
         val devices = bluetoothTransport.pairedDevices()
         if (devices.isEmpty()) {
-            statusText.text = "Aucun appareil Bluetooth appairé. Appaire d'abord les deux téléphones dans Android."
+            statusText.text = "Aucun appareil Bluetooth appairé · utilise APPAIRER UN TÉLÉPHONE."
+            withBluetoothScanPermission { showBluetoothPairingDialog() }
             return
         }
         val labels = devices.map { "${it.name} · ${it.address}" }.toTypedArray()
-        AlertDialog.Builder(this)
+        val picker = AlertDialog.Builder(this)
             .setTitle("Envoyer la session WebCS")
             .setItems(labels) { _, which ->
                 val device = devices[which]
@@ -662,8 +699,76 @@ class MainActivity : ComponentActivity() {
                     onComplete = { _, message -> runOnUiThread { statusText.text = message } }
                 )
             }
+            .setNeutralButton("RESCANNER", null)
             .setNegativeButton("ANNULER", null)
-            .show()
+            .create()
+        picker.setOnShowListener {
+            picker.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                picker.dismiss()
+                showBluetoothSendPicker()
+            }
+        }
+        picker.show()
+    }
+
+    private fun showBluetoothPairingDialog() {
+        if (!ensureBluetoothReady()) return
+        val devices = linkedMapOf<String, BluetoothDataTransport.NearbyDevice>()
+        val labels = mutableListOf<String>()
+        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
+        lateinit var pairingDialog: AlertDialog
+
+        fun refreshList() {
+            labels.clear()
+            labels.addAll(devices.values.map { device ->
+                val state = if (device.bonded) "APPARIÉ" else "NOUVEAU"
+                "${device.name} · $state · ${device.address}"
+            })
+            adapter.notifyDataSetChanged()
+        }
+
+        fun scan() {
+            devices.clear()
+            bluetoothTransport.pairedDevices().forEach {
+                devices[it.address] = BluetoothDataTransport.NearbyDevice(it.name, it.address, true)
+            }
+            refreshList()
+            statusText.text = "Bluetooth · scan en cours…"
+            bluetoothTransport.startDiscovery(
+                onDevice = { device -> runOnUiThread {
+                    devices[device.address] = device
+                    refreshList()
+                    if (device.bonded) statusText.text = "Bluetooth · ${device.name} appairé."
+                } },
+                onStatus = { message -> runOnUiThread { statusText.text = message } },
+                onFinished = { runOnUiThread {
+                    statusText.text = "Bluetooth · scan terminé · ${devices.size} appareil(s) visible(s)."
+                } }
+            )
+        }
+
+        pairingDialog = AlertDialog.Builder(this)
+            .setTitle("Appairer un téléphone WebCS")
+            .setAdapter(adapter, null)
+            .setPositiveButton("RESCANNER", null)
+            .setNegativeButton("FERMER", null)
+            .create()
+        pairingDialog.setOnShowListener {
+            pairingDialog.listView.setOnItemClickListener { _, _, which, _ ->
+                val device = devices.values.getOrNull(which) ?: return@setOnItemClickListener
+                if (device.bonded) {
+                    statusText.text = "${device.name} est déjà appairé et prêt pour WebCS."
+                } else {
+                    bluetoothTransport.pairDevice(device.address) { message ->
+                        runOnUiThread { statusText.text = message }
+                    }
+                }
+            }
+            pairingDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { scan() }
+            scan()
+        }
+        pairingDialog.setOnDismissListener { bluetoothTransport.stopDiscovery() }
+        pairingDialog.show()
     }
 
     private fun startBluetoothReceive() {
