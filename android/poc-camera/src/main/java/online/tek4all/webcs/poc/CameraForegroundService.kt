@@ -206,7 +206,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         ammo = magazineSize()
         sensorManager = getSystemService(SensorManager::class.java)
         motionSensor = chooseMotionSensor()
-        orientationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        orientationSensor = chooseOrientationSensor()
         updateSensorRegistration()
         createChannel()
         promoteToForeground(false)
@@ -615,9 +615,16 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     fun orientationCalibrationSummary(): String {
         val sensor = orientationSensor ?: return "Orientation recharge : capteur de rotation indisponible"
         if (!hasOrientationCalibration()) return "Orientation recharge : non calibrée · ${sensor.name}"
-        val angle = prefs.getFloat(PREF_ORIENTATION_LEARNED_ANGLE, 0f)
+        val readyElevation = prefs.getFloat(PREF_ORIENTATION_READY_ELEVATION, Float.NaN)
+        val flatElevation = prefs.getFloat(PREF_ORIENTATION_FLAT_ELEVATION, Float.NaN)
+        val course = if (readyElevation.isFinite() && flatElevation.isFinite()) {
+            abs(flatElevation - readyElevation)
+        } else {
+            prefs.getFloat(PREF_ORIENTATION_LEARNED_ANGLE, 0f)
+        }
         val gate = prefs.getFloat(PREF_ORIENTATION_GATE_DEG, ORIENTATION_GATE_MIN_DEG)
-        return "Orientation recharge : calibrée · course ${angle.roundToInt()}° · seuil ${gate.roundToInt()}°"
+        val wake = if (sensor.isWakeUpSensor) "wake-up" else "service + wake lock"
+        return "Orientation recharge : calibrée · élévation ${course.roundToInt()}° · seuil ${gate.roundToInt()}° · azimut libre 360° · ${sensor.name} · $wake"
     }
 
     fun startOrientationCalibration() {
@@ -1077,7 +1084,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
+        if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR || event.sensor.type == Sensor.TYPE_GAME_ROTATION_VECTOR) {
             handleOrientation(event)
             return
         }
@@ -1162,21 +1169,27 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             updateSensorRegistration()
             return
         }
-        val learnedAngle = angleDegrees(flat, stable)
+        val flatElevation = elevationDegrees(flat)
+        val readyElevation = elevationDegrees(stable)
+        val learnedAngle = abs(flatElevation - readyElevation)
         if (learnedAngle < ORIENTATION_CAL_MIN_SEPARATION_DEG) {
             orientationCalibrationStartedMs = now
-            notifyStatus("Position de tir trop proche de la position à plat (${learnedAngle.roundToInt()}°). Redresse davantage le téléphone et stabilise-le.")
+            notifyStatus("Position de tir trop proche de la position à plat en élévation (${learnedAngle.roundToInt()}°). Redresse davantage le téléphone et stabilise-le.")
             return
         }
 
         val gate = (learnedAngle * 0.30f).coerceIn(ORIENTATION_GATE_MIN_DEG, ORIENTATION_GATE_MAX_DEG)
         prefs.edit()
+            // Vecteurs conservés pour compatibilité avec les calibrations v0.10/v0.11.
             .putFloat(PREF_ORIENTATION_FLAT_X, flat[0])
             .putFloat(PREF_ORIENTATION_FLAT_Y, flat[1])
             .putFloat(PREF_ORIENTATION_FLAT_Z, flat[2])
             .putFloat(PREF_ORIENTATION_READY_X, stable[0])
             .putFloat(PREF_ORIENTATION_READY_Y, stable[1])
             .putFloat(PREF_ORIENTATION_READY_Z, stable[2])
+            // La décision de recharge ne dépend plus du cap : seule l'élévation caméra est apprise.
+            .putFloat(PREF_ORIENTATION_FLAT_ELEVATION, flatElevation)
+            .putFloat(PREF_ORIENTATION_READY_ELEVATION, readyElevation)
             .putFloat(PREF_ORIENTATION_LEARNED_ANGLE, learnedAngle)
             .putFloat(PREF_ORIENTATION_GATE_DEG, gate)
             .apply()
@@ -1187,7 +1200,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         reloadOrientationMoveStartMs = 0L
         beepCalibration(doubleBeep = true)
         speak("orientation calibrée")
-        notifyStatus("Orientation calibrée · position à plat ↔ visée ${learnedAngle.roundToInt()}° · recharge armée après ${gate.roundToInt()}° vers le haut.")
+        notifyStatus("Orientation calibrée · course verticale ${learnedAngle.roundToInt()}° · seuil ${gate.roundToInt()}° · cap/azimut totalement libre sur 360°.")
         updateSensorRegistration()
     }
 
@@ -1205,16 +1218,39 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
     }
 
     private fun handleReloadOrientationGate(now: Long, current: FloatArray) {
-        val ready = loadOrientationVector(PREF_ORIENTATION_READY_X, PREF_ORIENTATION_READY_Y, PREF_ORIENTATION_READY_Z) ?: return
-        val flat = loadOrientationVector(PREF_ORIENTATION_FLAT_X, PREF_ORIENTATION_FLAT_Y, PREF_ORIENTATION_FLAT_Z) ?: return
-        val learnedAngle = prefs.getFloat(PREF_ORIENTATION_LEARNED_ANGLE, angleDegrees(ready, flat)).coerceAtLeast(ORIENTATION_CAL_MIN_SEPARATION_DEG)
-        val gate = prefs.getFloat(PREF_ORIENTATION_GATE_DEG, (learnedAngle * 0.30f).coerceIn(ORIENTATION_GATE_MIN_DEG, ORIENTATION_GATE_MAX_DEG))
-        val angleReady = angleDegrees(ready, current)
-        val angleFlat = angleDegrees(flat, current)
+        // Une fenêtre déjà ouverte reste valide 5 s, quelle que soit l'orientation ensuite.
+        if (now <= reloadGateUntilMs) return
+
+        val readyVector = loadOrientationVector(PREF_ORIENTATION_READY_X, PREF_ORIENTATION_READY_Y, PREF_ORIENTATION_READY_Z)
+        val flatVector = loadOrientationVector(PREF_ORIENTATION_FLAT_X, PREF_ORIENTATION_FLAT_Y, PREF_ORIENTATION_FLAT_Z)
+        val readyElevation = if (prefs.contains(PREF_ORIENTATION_READY_ELEVATION)) {
+            prefs.getFloat(PREF_ORIENTATION_READY_ELEVATION, 0f)
+        } else {
+            readyVector?.let { elevationDegrees(it) } ?: return
+        }
+        val flatElevation = if (prefs.contains(PREF_ORIENTATION_FLAT_ELEVATION)) {
+            prefs.getFloat(PREF_ORIENTATION_FLAT_ELEVATION, 90f)
+        } else {
+            flatVector?.let { elevationDegrees(it) } ?: return
+        }
+
+        val course = flatElevation - readyElevation
+        val learnedAngle = abs(course).coerceAtLeast(ORIENTATION_CAL_MIN_SEPARATION_DEG)
+        val gate = prefs.getFloat(
+            PREF_ORIENTATION_GATE_DEG,
+            (learnedAngle * 0.30f).coerceIn(ORIENTATION_GATE_MIN_DEG, ORIENTATION_GATE_MAX_DEG)
+        )
+        val currentElevation = elevationDegrees(current)
+        val direction = if (course >= 0f) 1f else -1f
+        val progressUp = (currentElevation - readyElevation) * direction
+        val readyDistance = abs(currentElevation - readyElevation)
         val readyZone = (gate * 0.55f).coerceIn(8f, 18f)
 
-        // Tant que l'arme est en position de visée, une future rotation vers le haut est armée.
-        if (angleReady <= readyZone) {
+        // Le cap géographique n'intervient jamais : nord/sud/est/ouest et rotation 360° sont équivalents.
+        if (readyDistance <= readyZone) {
+            if (!reloadOrientationArmed) {
+                logGameEvent("reload_ready", latestResult, null, trainingLabel = "elevation_only")
+            }
             reloadOrientationArmed = true
             reloadOrientationMoveStartMs = now
             return
@@ -1223,19 +1259,19 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         if (!reloadOrientationArmed) return
         if (now - reloadOrientationMoveStartMs > RELOAD_ORIENTATION_TRANSITION_MS) {
             reloadOrientationArmed = false
+            reloadOrientationMoveStartMs = 0L
+            logGameEvent("reload_orientation_timeout", latestResult, null, trainingLabel = "elevation_only")
             return
         }
 
-        // On doit réellement se rapprocher de la référence "caméra vers le haut".
-        val gainTowardFlat = learnedAngle - angleFlat
-        if (gainTowardFlat >= gate && angleReady >= gate * 0.75f) {
+        if (progressUp >= gate) {
             reloadGateUntilMs = now + RELOAD_GATE_MS
             projectionImpulse = null
             reloadProjectionImpulse = null
             reloadOrientationArmed = false
             reloadOrientationMoveStartMs = 0L
-            logGameEvent("reload_gate", latestResult, null)
-            notifyStatus("Arme relevée selon ta calibration · RECHARGE autorisée 5 s · tir neutralisé pendant cette fenêtre.")
+            logGameEvent("reload_gate", latestResult, null, trainingLabel = "elevation_only")
+            notifyStatus("Arme relevée · RECHARGE autorisée 5 s · azimut libre 360° · tir neutralisé pendant cette fenêtre.")
         }
     }
 
@@ -1248,6 +1284,9 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val d = dot(a[0], a[1], a[2], b[0], b[1], b[2]).coerceIn(-1f, 1f)
         return Math.toDegrees(acos(d.toDouble())).toFloat()
     }
+
+    private fun elevationDegrees(vector: FloatArray): Float =
+        Math.toDegrees(asin(vector[2].coerceIn(-1f, 1f).toDouble())).toFloat()
 
     private fun beepCalibration(doubleBeep: Boolean = false) {
         val tone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 80) } catch (_: Exception) { null } ?: return
@@ -1383,6 +1422,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
 
     private fun handleReloadGestureDetection(now: Long, x: Float, y: Float, z: Float) {
         if (now > reloadGateUntilMs) {
+            if (reloadGateUntilMs > 0L) {
+                logGameEvent("reload_gate_timeout", latestResult, null)
+                reloadGateUntilMs = 0L
+            }
             reloadProjectionImpulse = null
             return
         }
@@ -1401,10 +1444,12 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val dt = if (first == null) Long.MAX_VALUE else now - first.timeMs
         if (first == null || dt > RELOAD_GESTURE_MAX_PAIR_MS) {
             reloadProjectionImpulse = ProjectionImpulse(projection, now)
+            logGameEvent("reload_impulse_1", latestResult, null)
             return
         }
         if (dt >= RELOAD_GESTURE_MIN_PAIR_MS && first.value * projection < 0f && abs(projection) >= threshold * 0.55f) {
             reloadProjectionImpulse = null
+            logGameEvent("reload_impulse_2", latestResult, null)
             reloadGateUntilMs = 0L
             lastReloadGestureMs = now
             lastGestureActionMs = now
@@ -1421,6 +1466,15 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     }
 
+    private fun chooseOrientationSensor(): Sensor? {
+        // WebCS n'a pas besoin du nord magnétique : privilégier le vecteur de jeu réduit
+        // les perturbations de cap. Variante wake-up prioritaire pour l'usage écran éteint.
+        return sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR, true)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR, true)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    }
+
     private fun updateSensorRegistration(force: Boolean = false) {
         val orientationCalibrationActive = orientationCalibrationStage != ORIENTATION_CAL_NONE
         val reloadEnabled = prefs.getBoolean(PREF_RELOAD_GESTURE_ENABLED, false) || calibratingReloadGesture || orientationCalibrationActive
@@ -1428,7 +1482,6 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         if (shouldRun && !sensorRegistered) {
             motionSensor?.let {
                 sensorRegistered = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-                if (sensorRegistered && !it.isWakeUpSensor) acquireGestureWakeLock()
             }
         }
         if (shouldRun && reloadEnabled && !orientationRegistered) {
@@ -1442,14 +1495,22 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         if (!shouldRun && sensorRegistered) {
             motionSensor?.let { sensorManager.unregisterListener(this, it) }
             sensorRegistered = false
-            releaseGestureWakeLock()
         }
+
+        // Un accéléromètre wake-up ne suffit pas si le capteur d'orientation, lui, ne l'est pas.
+        // Maintenir le CPU éveillé tant qu'un capteur non-wake-up nécessaire au geste est enregistré.
+        val needsWakeLock = shouldRun && (
+            (sensorRegistered && motionSensor?.isWakeUpSensor != true) ||
+            (orientationRegistered && orientationSensor?.isWakeUpSensor != true)
+        )
+        if (needsWakeLock) acquireGestureWakeLock() else releaseGestureWakeLock()
     }
 
     private fun hasGestureCalibration(): Boolean = prefs.contains(PREF_GESTURE_THRESHOLD)
     private fun hasReloadGestureCalibration(): Boolean = prefs.contains(PREF_RELOAD_GESTURE_THRESHOLD)
     private fun hasOrientationCalibration(): Boolean =
-        prefs.contains(PREF_ORIENTATION_FLAT_X) && prefs.contains(PREF_ORIENTATION_READY_X) && prefs.contains(PREF_ORIENTATION_LEARNED_ANGLE)
+        (prefs.contains(PREF_ORIENTATION_FLAT_ELEVATION) && prefs.contains(PREF_ORIENTATION_READY_ELEVATION) && prefs.contains(PREF_ORIENTATION_LEARNED_ANGLE)) ||
+            (prefs.contains(PREF_ORIENTATION_FLAT_X) && prefs.contains(PREF_ORIENTATION_READY_X) && prefs.contains(PREF_ORIENTATION_LEARNED_ANGLE))
 
     private fun dot(ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float): Float = ax * bx + ay * by + az * bz
 
@@ -1645,6 +1706,8 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         private const val PREF_ORIENTATION_READY_X = "orientation.readyX"
         private const val PREF_ORIENTATION_READY_Y = "orientation.readyY"
         private const val PREF_ORIENTATION_READY_Z = "orientation.readyZ"
+        private const val PREF_ORIENTATION_FLAT_ELEVATION = "orientation.flatElevation"
+        private const val PREF_ORIENTATION_READY_ELEVATION = "orientation.readyElevation"
         private const val PREF_ORIENTATION_LEARNED_ANGLE = "orientation.learnedAngle"
         private const val PREF_ORIENTATION_GATE_DEG = "orientation.gateDeg"
         private const val CHANNEL_ID = "webcs_camera"
