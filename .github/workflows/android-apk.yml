@@ -7,17 +7,11 @@ on:
       - 'android/**'
       - 'settings.gradle.kts'
       - 'gradle.properties'
-      - 'tools/hotfix_camera_analysis.py'
-      - 'tools/hotfix_bluetooth_pairing.py'
-      - 'tools/add_user_sfx.py'
-      - 'tools/add_data_import_bluetooth.py'
-      - 'tools/add_bluetooth_pairing.py'
-      - 'tools/sfx/**'
       - '.github/workflows/android-apk.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -25,32 +19,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Apply CameraX analysis hotfix
-        run: python3 tools/hotfix_camera_analysis.py
-
-      - name: Prepare user shot and reload sounds
-        run: python3 tools/add_user_sfx.py
-
-      - name: Add data import and direct Bluetooth sharing
-        run: python3 tools/add_data_import_bluetooth.py
-
-      - name: Add Bluetooth discovery pairing and rescan
-        run: python3 tools/add_bluetooth_pairing.py
-
-      - name: Fix Bluetooth pairing list selection
-        run: python3 tools/hotfix_bluetooth_pairing.py
-
-      - name: Commit generated source changes if needed
-        shell: bash
-        run: |
-          if ! git diff --quiet -- android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/MainActivity.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/BluetoothDataTransport.kt android/poc-camera/src/main/AndroidManifest.xml android/poc-camera/build.gradle.kts; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/MainActivity.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/BluetoothDataTransport.kt android/poc-camera/src/main/AndroidManifest.xml android/poc-camera/build.gradle.kts
-            git commit -m "Add Bluetooth pairing discovery and rescan"
-            git push
-          fi
 
       - name: Java 17
         uses: actions/setup-java@v4
@@ -69,6 +37,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: WebCS-v0.11.1-debug-apk
+          name: WebCS-v0.11.2-debug-apk
           path: android/poc-camera/build/outputs/apk/debug/poc-camera-debug.apk
           if-no-files-found: error
