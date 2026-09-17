@@ -10,6 +10,7 @@ on:
       - 'tools/hotfix_camera_analysis.py'
       - 'tools/add_hot_stream_training.py'
       - 'tools/add_user_sfx.py'
+      - 'tools/add_data_import_bluetooth.py'
       - 'tools/sfx/**'
       - '.github/workflows/android-apk.yml'
   workflow_dispatch:
@@ -33,6 +34,9 @@ jobs:
       - name: Add user shot reload and hit reward sounds
         run: python3 tools/add_user_sfx.py
 
+      - name: Add data import and direct Bluetooth sharing
+        run: python3 tools/add_data_import_bluetooth.py
+
       - name: Commit generated source changes if needed
         shell: bash
         run: |
@@ -40,7 +44,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt android/poc-camera/src/main/java/online/tek4all/webcs/poc/MainActivity.kt android/poc-camera/build.gradle.kts
-            git commit -m "Wire user sounds and hit reward"
+            git commit -m "Add reusable data import and Bluetooth exchange"
             git push
           fi
 
@@ -61,6 +65,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: WebCS-v0.10.1-debug-apk
+          name: WebCS-v0.11.0-debug-apk
           path: android/poc-camera/build/outputs/apk/debug/poc-camera-debug.apk
           if-no-files-found: error
