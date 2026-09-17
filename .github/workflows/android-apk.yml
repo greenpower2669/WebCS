@@ -8,6 +8,7 @@ on:
       - 'settings.gradle.kts'
       - 'gradle.properties'
       - 'tools/hotfix_camera_analysis.py'
+      - 'tools/hotfix_bluetooth_pairing.py'
       - 'tools/add_user_sfx.py'
       - 'tools/add_data_import_bluetooth.py'
       - 'tools/add_bluetooth_pairing.py'
@@ -36,6 +37,9 @@ jobs:
 
       - name: Add Bluetooth discovery pairing and rescan
         run: python3 tools/add_bluetooth_pairing.py
+
+      - name: Fix Bluetooth pairing list selection
+        run: python3 tools/hotfix_bluetooth_pairing.py
 
       - name: Commit generated source changes if needed
         shell: bash
