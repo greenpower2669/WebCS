@@ -381,9 +381,15 @@ class MainActivity : ComponentActivity() {
         }
         content.addView(resetGameButton)
 
+        val refereeShotButton = Button(this).apply {
+            text = "ARBITRE · CORRIGER UN TIR"
+            contentDescription = "Ajouter une décision humaine sur un tir sans modifier l'événement original"
+        }
+        content.addView(refereeShotButton)
+
         val recentGamesButton = Button(this).apply {
             text = "ARBITRE · DERNIÈRES PARTIES"
-            contentDescription = "Afficher les dernières parties sauvegardées avec score et tirs reconnus"
+            contentDescription = "Afficher les dernières parties sauvegardées avec score, tirs reconnus et arbitrages"
         }
         content.addView(recentGamesButton)
 
@@ -576,6 +582,34 @@ class MainActivity : ComponentActivity() {
                     }
                     .setNegativeButton("ANNULER", null)
                     .show()
+            }
+
+            refereeShotButton.setOnClickListener {
+                val shots = service.recentRefereeShots(20)
+                if (shots.isEmpty()) {
+                    statusText.text = "Arbitre : aucun tir dans la partie courante."
+                } else {
+                    val labels = shots.map {
+                        "Tir #${it.seq} · ${if (it.recognizedHit) "reconnu TOUCHÉ" else "reconnu RATÉ"} · ${it.player}"
+                    }.toTypedArray()
+                    AlertDialog.Builder(this)
+                        .setTitle("Arbitre · choisir un tir")
+                        .setItems(labels) { _, which ->
+                            val shot = shots[which]
+                            val choices = arrayOf("VALIDER TOUCHÉ", "VALIDER RATÉ")
+                            AlertDialog.Builder(this)
+                                .setTitle("Tir #${shot.seq}")
+                                .setMessage("La décision humaine sera ajoutée séparément au CSV ; le tir original reste inchangé.")
+                                .setItems(choices) { _, choice ->
+                                    service.recordRefereeDecision(shot.seq, choice == 0)
+                                    dataSummary.text = service.sessionDataSummary()
+                                }
+                                .setNegativeButton("ANNULER", null)
+                                .show()
+                        }
+                        .setNegativeButton("FERMER", null)
+                        .show()
+                }
             }
 
             recentGamesButton.setOnClickListener {
