@@ -102,6 +102,7 @@ class WebCsDataExchange(context: Context) {
         var shots = 0
         var hits = 0
         var score = 0
+        var refereeLabels = 0
         var ended = false
 
         for (line in lines.drop(1)) {
@@ -115,11 +116,13 @@ class WebCsDataExchange(context: Context) {
                     shots++
                     if (hitIndex in cols.indices && cols[hitIndex].equals("true", ignoreCase = true)) hits++
                 }
+                "referee_label" -> refereeLabels++
                 "game_end" -> ended = true
             }
         }
         val state = if (ended) "terminée" else "en cours"
-        return "$player · score $score · $hits/$shots touchés · $state · $session"
+        val referee = if (refereeLabels > 0) " · $refereeLabels arbitrage(s)" else ""
+        return "$player · score $score · $hits/$shots touchés$referee · $state · $session"
     }
 
     fun reuseLatestImportedCalibration(targetProfile: String): String {
