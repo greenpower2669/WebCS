@@ -374,15 +374,35 @@ class MainActivity : ComponentActivity() {
         content.addView(playerEdit)
         val dataSummary = label(service.sessionDataSummary())
         content.addView(dataSummary)
+
+        val resetGameButton = Button(this).apply {
+            text = "RESET PARTIE / NOUVELLE PARTIE"
+            contentDescription = "Terminer et conserver la partie courante puis remettre score et chargeur à zéro"
+        }
+        content.addView(resetGameButton)
+
+        val recentGamesButton = Button(this).apply {
+            text = "ARBITRE · DERNIÈRES PARTIES"
+            contentDescription = "Afficher les dernières parties sauvegardées avec score et tirs reconnus"
+        }
+        content.addView(recentGamesButton)
+
         val newSessionButton = Button(this).apply {
-            text = "NOUVELLE SESSION DATA"
-            contentDescription = "Effacer les événements de test et démarrer une nouvelle session"
+            text = "NOUVELLE SESSION DATA · SANS RESET SCORE"
+            contentDescription = "Démarrer un nouveau fichier de données sans remettre la partie à zéro"
         }
         content.addView(newSessionButton)
-        content.addView(label("Chaque tir est sauvegardé automatiquement avec la frame caméra la plus proche, les pixels centraux, le résultat de reconnaissance et les timestamps. Le CSV sert à l'entraînement et à l'arbitrage."))
+        content.addView(label("Chaque tir est sauvegardé automatiquement avec la frame caméra la plus proche, les pixels centraux, le résultat de reconnaissance et les timestamps. Un RESET termine le CSV de la partie précédente avant d'en créer un nouveau."))
+
+        val saveDataButton = Button(this).apply {
+            text = "SAUVEGARDER / EXPORTER CSV"
+            contentDescription = "Enregistrer une copie du CSV courant dans Téléchargements WebCS"
+        }
+        content.addView(saveDataButton)
+
         val shareDataButton = Button(this).apply {
             text = "PARTAGER DATA ENTRAÎNEMENT / ARBITRAGE"
-            contentDescription = "Exporter et partager les données de tirs, reconnaissance et entraînement"
+            contentDescription = "Exporter puis partager les données de tirs, reconnaissance et entraînement"
         }
         content.addView(shareDataButton)
         val importedDataSummary = label(dataExchange.importedSummary())
@@ -545,10 +565,42 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            resetGameButton.setOnClickListener {
+                service.setPlayerName(playerEdit.text.toString())
+                AlertDialog.Builder(this)
+                    .setTitle("Nouvelle partie")
+                    .setMessage("La partie actuelle et son CSV restent conservés pour l'arbitrage. Le score et le chargeur seront remis à zéro.")
+                    .setPositiveButton("RESET") { _, _ ->
+                        service.resetGame()
+                        dataSummary.text = service.sessionDataSummary()
+                    }
+                    .setNegativeButton("ANNULER", null)
+                    .show()
+            }
+
+            recentGamesButton.setOnClickListener {
+                val games = dataExchange.recentSessionSummaries(10)
+                if (games.isEmpty()) {
+                    statusText.text = "Arbitre : aucune partie sauvegardée pour le moment."
+                } else {
+                    AlertDialog.Builder(this)
+                        .setTitle("Arbitre · dernières parties")
+                        .setItems(games.toTypedArray(), null)
+                        .setNegativeButton("FERMER", null)
+                        .show()
+                }
+            }
+
             newSessionButton.setOnClickListener {
                 service.setPlayerName(playerEdit.text.toString())
                 service.startNewDataSession()
                 dataSummary.text = service.sessionDataSummary()
+            }
+
+            saveDataButton.setOnClickListener {
+                service.setPlayerName(playerEdit.text.toString())
+                val uri = service.exportSessionCsv()
+                if (uri != null) dataSummary.text = service.sessionDataSummary()
             }
 
             shareDataButton.setOnClickListener {
@@ -573,8 +625,12 @@ class MainActivity : ComponentActivity() {
 
             reuseCalibrationButton.setOnClickListener {
                 val message = dataExchange.reuseLatestImportedCalibration(service.currentSettings().profileId)
+                if (message.startsWith("Calibration réutilisée")) {
+                    service.recordImportedCalibrationSnapshot()
+                }
                 importedDataSummary.text = dataExchange.importedSummary()
                 profileText.text = service.calibrationSummary()
+                dataSummary.text = service.sessionDataSummary()
                 statusText.text = message
             }
 
