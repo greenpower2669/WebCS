@@ -444,6 +444,44 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         listener?.onStatus("Nouvelle session de données · $sessionId · sauvegarde auto active")
     }
 
+    fun resetGame() {
+        // Fermer proprement la partie dans son CSV avant de créer la suivante.
+        val previousScore = score
+        val previousAmmo = ammo
+        logGameEvent("game_end", latestResult, null, trainingLabel = "reset")
+
+        score = 0
+        prefs.edit().putInt("score", 0).apply()
+        ammo = magazineSize()
+        reloading = false
+        reloadGateUntilMs = 0L
+        reloadOrientationArmed = false
+        reloadOrientationMoveStartMs = 0L
+        projectionImpulse = null
+        reloadProjectionImpulse = null
+        lastGestureActionMs = 0L
+        lastGestureShotMs = 0L
+        lastReloadGestureMs = 0L
+
+        startNewDataSession()
+        logGameEvent("game_start", latestResult, null, trainingLabel = "reset")
+        listener?.onReady(score, isRecording())
+        notifyAmmo()
+        notifyStatus("Nouvelle partie · score 0 · chargeur ${ammo}/${magazineSize()} · partie précédente conservée (score $previousScore, munitions $previousAmmo).")
+    }
+
+    fun recordImportedCalibrationSnapshot() {
+        val id = currentSettings().profileId
+        if (!prefs.contains("target.$id.r")) return
+        val r = prefs.getInt("target.$id.r", 0)
+        val g = prefs.getInt("target.$id.g", 0)
+        val b = prefs.getInt("target.$id.b", 0)
+        val hsv = FloatArray(3)
+        Color.RGBToHSV(r, g, b, hsv)
+        val snapshot = ScanResult(false, 0, 0, r, g, b, hsv[0], hsv[1], hsv[2])
+        logGameEvent("target_calibration_snapshot", snapshot, null, trainingLabel = "enemy_reference_imported")
+    }
+
     private fun trainingDir(): File = File(filesDir, "webcs-training").apply { mkdirs() }
 
     private fun currentSessionFile(): File = File(trainingDir(), "WebCS-training-$sessionId.csv")
@@ -539,7 +577,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         val points = chosenFrame?.decisionPoints?.take(5).orEmpty()
         val values = mutableListOf<String>()
         values += listOf(
-            "2", sessionId, seq.toString(), type,
+            "3", sessionId, seq.toString(), type,
             System.currentTimeMillis().toString(), nowNs.toString(), (nowNs - sessionStartElapsedNs).toString(),
             trigger.toString(), frameNs?.toString() ?: "", deltaUs?.toString() ?: "",
             currentPlayerName(), hit?.toString() ?: "", trainingLabel,
@@ -556,7 +594,10 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
             lastCameraElevationDeg?.toString() ?: "",
             selectedCameraId(), effectiveWidth.toString(), effectiveHeight.toString(),
             prefs.getString(PREF_SAMPLE_MODE, SAMPLE_FIVE) ?: SAMPLE_FIVE,
-            ammo.toString(), magazineSize().toString(), score.toString(), currentSettings().profileId
+            ammo.toString(), magazineSize().toString(), score.toString(), currentSettings().profileId,
+            if (prefs.contains("target.${currentSettings().profileId}.tolerance")) {
+                prefs.getFloat("target.${currentSettings().profileId}.tolerance", 42f).toString()
+            } else ""
         )
         val row = values.joinToString(",") { csv(it) }
         synchronized(eventLog) { eventLog.add(row) }
@@ -1677,7 +1718,7 @@ class CameraForegroundService : LifecycleService(), TextToSpeech.OnInitListener,
         private const val WEBSC_V080 = "context-reload-data-v1"
         private const val WEBSC_V090 = "hot-stream-shot-classification-training-v1"
         private const val WEBSC_V010 = "relative-orientation-calibration-v1"
-        private const val CSV_HEADER = "schema_version,session_id,seq,event,wall_time_ms,elapsed_realtime_ns,session_elapsed_ns,trigger_time_ns,camera_frame_ns,frame_delta_us,player,recognized_hit,training_label,recognition_mode,target_distance,r,g,b,h,s,v,p0_r,p0_g,p0_b,p1_r,p1_g,p1_b,p2_r,p2_g,p2_b,p3_r,p3_g,p3_b,p4_r,p4_g,p4_b,patch_size,patch_rgb_hex,elevation_deg,camera_id,width,height,sample_mode,ammo,capacity,score,target_profile"
+        private const val CSV_HEADER = "schema_version,session_id,seq,event,wall_time_ms,elapsed_realtime_ns,session_elapsed_ns,trigger_time_ns,camera_frame_ns,frame_delta_us,player,recognized_hit,training_label,recognition_mode,target_distance,r,g,b,h,s,v,p0_r,p0_g,p0_b,p1_r,p1_g,p1_b,p2_r,p2_g,p2_b,p3_r,p3_g,p3_b,p4_r,p4_g,p4_b,patch_size,patch_rgb_hex,elevation_deg,camera_id,width,height,sample_mode,ammo,capacity,score,target_profile,target_tolerance"
         const val SAMPLE_CENTER = "center"
         const val SAMPLE_FIVE = "five"
         private const val PREF_CAMERA_ID = "camera.id"
