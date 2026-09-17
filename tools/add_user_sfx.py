@@ -2,7 +2,6 @@ from pathlib import Path
 import base64
 
 SERVICE = Path("android/poc-camera/src/main/java/online/tek4all/webcs/poc/CameraForegroundService.kt")
-GRADLE = Path("android/poc-camera/build.gradle.kts")
 RAW_DIR = Path("android/poc-camera/src/main/res/raw")
 SFX_DIR = Path("tools/sfx")
 
@@ -15,7 +14,7 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     raise SystemExit(f"Pattern not found for {label}")
 
 
-# --- Decode user-provided audio resources for the Android build -----------------
+# Decode the user-provided audio resources at build time.
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 for src_name, dst_name in (("tir.ogg.b64", "tir.ogg"), ("reload.ogg.b64", "reload.ogg")):
     src = SFX_DIR / src_name
@@ -27,7 +26,7 @@ for src_name, dst_name in (("tir.ogg.b64", "tir.ogg"), ("reload.ogg.b64", "reloa
     print(f"Decoded {src} -> {dst} ({len(data)} bytes)")
 
 
-# --- Wire SfxEngine with Context and play reward only on validated hits ----------
+# Keep the source wiring idempotent, without owning the app version anymore.
 service = SERVICE.read_text(encoding="utf-8")
 service = replace_once(
     service,
@@ -43,11 +42,4 @@ service = replace_once(
 )
 SERVICE.write_text(service, encoding="utf-8")
 
-
-# --- Version --------------------------------------------------------------------
-gradle = GRADLE.read_text(encoding="utf-8")
-gradle = replace_once(gradle, 'versionCode = 11', 'versionCode = 12', 'versionCode')
-gradle = replace_once(gradle, 'versionName = "0.10.0"', 'versionName = "0.10.1"', 'versionName')
-GRADLE.write_text(gradle, encoding="utf-8")
-
-print("WebCS v0.10.1 user SFX integration applied")
+print("User SFX resources prepared")
